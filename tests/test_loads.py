@@ -2,8 +2,12 @@
 import pytest
 
 from cfs_rsg_mcp.cfs_loads import (
-    axial_plf, axial_stud, build_load_combinations, lateral_stud_moment,
-    lateral_stud_shear, unbraced_lengths,
+    axial_plf,
+    axial_stud,
+    build_load_combinations,
+    lateral_stud_moment,
+    lateral_stud_shear,
+    unbraced_lengths,
 )
 
 

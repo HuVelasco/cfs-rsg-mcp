@@ -29,8 +29,10 @@ import re
 from contextlib import contextmanager
 from typing import Dict, List, Optional
 
-import pythoncom
-from win32com.client import dynamic
+# NOTE: pywin32 (pythoncom / win32com) is imported LAZILY inside cfs_session()
+# and _mk(), not at module load. This keeps the package importable on any OS
+# (so parsing/load/catalog logic can be unit-tested off-Windows and in CI); the
+# Windows-only COM dependency is only required when you actually talk to CFS.
 
 PROGID = "RSG.CFS15.Calculation"
 _NS = "RSG.CFS15."  # namespace prefix for helper classes (MemberParams, SectionForces...)
@@ -230,6 +232,14 @@ def cfs_session():
             s.load("600S200-43")
             props = s.gross_properties()
     """
+    try:
+        import pythoncom
+        from win32com.client import dynamic
+    except ImportError as e:  # noqa: BLE001
+        raise CFSError(
+            "pywin32 is required to talk to CFS (Windows only). "
+            f"Install it with 'pip install pywin32'. Underlying error: {e}"
+        )
     pythoncom.CoInitialize()
     calc = None
     session = None
@@ -260,6 +270,7 @@ def cfs_session():
 
 def _mk(name: str):
     """Create a CFS15 helper COM object (MemberParams, SectionForces, SectionData)."""
+    from win32com.client import dynamic
     return dynamic.Dispatch(_NS + name)
 
 
@@ -382,9 +393,13 @@ class _Session:
 
     def _forces(self, P=0.0, Mx=0.0, My=0.0, Vx=0.0, Vy=0.0, Dx=0.0, Dy=0.0):
         f = _mk("SectionForces")
-        f.P = float(P); f.Mx = float(Mx); f.My = float(My)
-        f.Vx = float(Vx); f.Vy = float(Vy)
-        f.Dx = float(Dx); f.Dy = float(Dy)
+        f.P = float(P)
+        f.Mx = float(Mx)
+        f.My = float(My)
+        f.Vx = float(Vx)
+        f.Vy = float(Vy)
+        f.Dx = float(Dx)
+        f.Dy = float(Dy)
         return f
 
     def member_strengths(self, spec: int, lengths: Dict, **overrides) -> Dict:

@@ -42,8 +42,15 @@ from mcp.server.fastmcp import FastMCP
 
 from . import catalog
 from .cfs_engine import (
-    CFSError, DEFAULT_SPEC, SPEC_NAME_BY_ID, cfs_install_dir, cfs_session,
-    describe_flags, parse_designation, resolve_spec, section_label,
+    DEFAULT_SPEC,
+    SPEC_NAME_BY_ID,
+    CFSError,
+    cfs_install_dir,
+    cfs_session,
+    describe_flags,
+    parse_designation,
+    resolve_spec,
+    section_label,
 )
 from .cfs_loads import build_load_combinations, unbraced_lengths
 
