@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfs-rsg-mcp"
+version = "0.1.0"
+description = "MCP server for cold-formed steel wall-stud design over the RSG CFS 15 Automation Module (COM)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Hugo Velasco", email = "hugovelp@gmail.com" }]
+keywords = [
+    "mcp", "cold-formed-steel", "cfs", "structural-engineering",
+    "aisi", "wall-stud", "rsg", "ssma",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.1"]
+
+[project.urls]
+Homepage = "https://github.com/HuVelasco/cold-formed-steel-cfs-rsg-mcp"
+Repository = "https://github.com/HuVelasco/cold-formed-steel-cfs-rsg-mcp"
+Issues = "https://github.com/HuVelasco/cold-formed-steel-cfs-rsg-mcp/issues"
+
+[project.scripts]
+cfs-rsg-mcp = "cfs_rsg_mcp.server:main"
+
+[tool.setuptools]
+packages = ["cfs_rsg_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: tests that require a licensed, running CFS 15 with the Automation option",
+]

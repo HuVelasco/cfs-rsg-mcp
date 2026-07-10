@@ -1,0 +1,10 @@
+# RSG CFS MCP Server - dependencies
+# ==================================
+# Windows only. Requires RSG CFS 15 installed + licensed WITH the Automation option,
+# and the CFS15 Automation Module (cfs15dllinst.exe) registered.
+
+# MCP framework
+mcp>=1.0.0
+
+# Windows COM bridge to the CFS15 Automation Module (RSG.CFS15.Calculation)
+pywin32>=306

@@ -1,0 +1,42 @@
+# ─── Proprietary / copyrighted data — NEVER publish ───────────────────────────
+# RSG Software's copyrighted CFS15 Automation Module manual, and the user's
+# custom .cfss section libraries + notebooks. Kept local only.
+Info-and-Examples/
+*.cfss
+*.cfsl
+
+# ─── Local agent / editor state ───────────────────────────────────────────────
+.claude/
+memory/
+MEMORY.md
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ─── OS / IDE ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

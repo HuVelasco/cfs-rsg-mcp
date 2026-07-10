@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "cfs-rsg": {
+      "command": "python",
+      "args": ["-m", "cfs_rsg_mcp"],
+      "env": {
+        "PYTHONPATH": "C:\\path\\to\\cold-formed-steel-cfs-rsg-mcp",
+        "PYTHONIOENCODING": "utf-8",
+        "CFS_MCP_SECTIONS_DIR": "C:\\path\\to\\your\\sections"
+      }
+    }
+  }
+}
