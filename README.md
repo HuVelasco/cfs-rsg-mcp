@@ -82,8 +82,9 @@ Restart Claude Desktop. For **Claude Code**:
 | `list_standard_profiles` | List SSMA/SFIA/AISI/HUD/LGSI designations (filter by type/depth). |
 | `list_custom_profiles` | List your `.cfss` files in a folder. |
 | `get_section_properties` | Gross section properties + fully-braced strengths for one section. |
-| `check_stud` | AISI member check on one stud (explicit forces or ASD load combos). |
-| `design_wall` | Try candidate sections, return the **lightest that passes** all ASD combos. |
+| `check_stud` | AISI member check on one stud (explicit forces or ASD load combos); every combo, limit-state strengths, web crippling, deflection; pinned or cantilever. |
+| `design_wall` | Try candidate sections, return the **lightest that passes** all ASD combos (and the deflection limit, if given). |
+| `design_stacked_wall` | Multi-storey stacked wall: loads accumulated down the stack, ASCE 7-22 §4.7 live load reduction, AB/A/B live patterns, stud alignment; Simpson-style per-level summary. |
 | `find_equivalent_profiles` | Which custom profiles ≥ a standard spec at a fixed spacing. |
 | `find_wall_substitutions` | **Headline:** full ratio table of MSBS substitutions across spacings (pass & fail) for engineer judgment. |
 | `check_members_batch` | Code-check many members with forces (ETABS/SAP2000 truss output). |
@@ -95,8 +96,20 @@ Restart Claude Desktop. For **Claude Code**:
 - a custom `.cfss` file path;
 - a full library path — `SSMA.cfsl|Structural Studs 33 ksi\600S200-43.cfss`.
 
-**Specification** defaults to `AISI2024USASD` (enum `42`). Override with
-`spec="AISI2022USASD"` or an int on any design tool.
+**Specification** defaults to `AISI2016USASD` (enum `27`) = AISI S100-16 (2020)
+w/S2-20, the edition referenced by IBC 2024 / IBC 2021 / BCNYS 2025. Every tool
+echoes the spec it used (`spec_used`) and warns when it does not match
+`building_code` (default `IBC2024`). Override with `spec="AISI2024USASD"` or an
+int — but note S100-24 can overstate capacity against an S100-16 code of record
+(362SLS155-43 single at 48" bracing: Pa 3.564 k vs 2.658 k).
+
+**Watchdog.** `connect_cfs`, `check_stud`, `design_wall`, `design_stacked_wall`,
+`find_wall_substitutions` and `check_members_batch` run CFS in an isolated child
+process with a per-call timeout (`timeout_s`, default 60 s, or the
+`CFS_MCP_TIMEOUT_S` env var). The CFS COM server is in-process .NET, so a hung call
+cannot be interrupted in-thread; the watchdog kills the hung engine (the next call
+gets a fresh one), returns the work finished so far as `partial_results`, and names
+the section/combo that hung. `CFS_MCP_WATCHDOG=0` runs jobs inline for debugging.
 
 ---
 
@@ -130,42 +143,51 @@ its `SINGLE` subfolder by default); point elsewhere with `custom_directory=...`
 > using MSBS sections."*
 
 ```
-find_wall_substitutions(standard="600S162-43", height_ft=10, spacing_in=16)
+find_wall_substitutions(standard="600S162-43", height_ft=10, wall_type="exterior",
+    spacing_in=16)
 ```
 
-It tries **single** studs (`SINGLE`) and **double** built-ups (`B2B` back-to-back,
-`BOX`), each at every allowed **stud spacing**, and returns **every profile with
-its full ratio table — passing and failing** — because the engineer, not the tool,
-owns the judgment call. Member strength depends only on the section and unbraced
-length (not spacing), so each section is evaluated by CFS once and spacings are
-swept analytically (every ratio scales by `ref_spacing / s`).
+It tries **single** studs (`SINGLE`) and **back-to-back doubles** (`B2B`), each at
+every candidate **stud spacing** and gauge at the matched depth, builds the full
+matrix, and **selects the most efficient passing wall** — the lightest weight per
+ft² (`weight_plf × 12/spacing`), preferring a single over a double at comparable
+weight. Member strength depends only on the section and unbraced length (not
+spacing), so each section is evaluated by CFS once and spacings are swept
+analytically (every ratio scales by `ref_spacing / s`).
 
-Key controls, matching how walls are actually detailed:
+`wall_type` (`"interior"` / `"exterior"`) is **required** — it is never silently
+defaulted. Key controls, matching how walls are actually detailed:
 
-- **`allowed_spacings`** — an *ordered* list, widest first, used **exactly as
-  given** (the reference spacing is never auto-added). For sheet-driven layouts:
-  `allowed_spacings=[30, 15]` — 30″ (sheet width) preferred, 15″ as the fallback.
-- **`categories=["single"]`** — when back-to-back / box doubles are not allowed.
-- **`governing`** — which check must pass for a spacing to count:
-  `"both"` (P **and** Mx, default — exterior / wind walls), `"axial"` (P only —
-  **interior wall with no wind**, where Mx demand is zero), or `"flexural"`.
-  Both `axial_ratio` and `flexural_ratio` are **always** reported regardless, so a
-  case where P passes but Mx doesn't is visible for you to judge.
+- **Spacings** default to `[spacing_in, 12, 16, 24]`. Override with an *exact*
+  ordered `allowed_spacings` list — e.g. `[30, 15]` for a 30″ sheet width with a
+  15″ fallback. The whole list is always evaluated (no early stop).
+- **`reference_n=2`** — the wall being replaced is a *double* standard build-up;
+  the reference P/Mx/Ix/weight are multiplied by N plies (idealized, flagged).
+- **`include_boxed=True`** — also consider `BOX` doubles (B2B only by default).
+- **`categories=["single"]`** — when doubles are not allowed at all.
+- **`adjacent_spacing_in` + `load_transfer_present`** — cross-floor stud-alignment
+  check: if the selected spacing doesn't stack with the level above/below and there
+  is no load-transfer member, the result is flagged.
+- **`governing`** — what counts as a pass for selection: `"both"` (P **and** Mx,
+  default), `"axial"` (P only — interior/no-wind), or `"flexural"`. A row that
+  passes P but fails Mx is **never auto-accepted** — it is returned flagged for
+  both wall types so you judge it.
 
 ```
 # Interior wall, no wind, single sections, sheet-friendly spacing:
-find_wall_substitutions(standard="400S300-68", height_ft=10, spacing_in=30,
-    brace_config="quarter", allowed_spacings=[30, 15],
+find_wall_substitutions(standard="400S300-68", height_ft=10, wall_type="interior",
+    spacing_in=30, brace_config="quarter", allowed_spacings=[30, 15],
     categories=["single"], depth_filter_in=[3.62], governing="axial")
 ```
 
-Each profile returns: capacity ratios, `max_continuous_spacing_axial/flexural/
-combined_in`, a `by_spacing` breakdown (P/Mx/Ix/weight ratio + `axial_ok`/
-`flexural_ok`/`passes` at every spacing), `best_spacing_in` (widest passing under
-`governing`, or null), weight vs. original, and `NoteFlags` with plain-English
-notes. Profiles are ranked passing-first (lightest), then failing by how close.
-When nothing passes, the message reports the **closest** section and its max
-reachable spacing — never a bare "unsuitable".
+Output always includes a plain-language **`substitution_table`** (original →
+substitute, spacing, category, P/Mx ratios, and a readable status), the
+**`selected`** wall with actual capacities and required values, and **`profiles`**
+(per-candidate `by_spacing` ratios + `NoteFlags`). Pass `include_all_configs=True`
+for the full **audit table** of every tried row (with the single `most_efficient`
+row marked), and `include_trace=True` for CFS's calculation trace. If no MSBS
+section passes at any spacing, the search **falls back to standard sections** at
+the matched depth (`category: "standard"`) — never a silent empty result.
 
 ---
 
@@ -212,11 +234,25 @@ not the analysis model. Use kip-inch units in the model to match.
 Adapted from a validated wall-stud design workflow. A stud is a
 simply-supported beam-column:
 
-- **Axial:** `P_stud (k) = PSF × trib_ft × spacing_ft / 1000`
-- **Lateral (wind/seismic):** `w = PSF × spacing_ft`; `Mx = w·H²/8`, `Vy = w·H/2`
+- **Axial:** `P_stud (k) = PSF × trib_ft × spacing_ft / 1000` — for D, L **and**
+  the roof loads Lr / S / R (over `trib_A + trib_B`; exterior walls use `trib_A`).
+  Line loads (plf) and point loads (k/stud) at the top of the wall are supported.
+- **Lateral:** `w = PSF × spacing_ft`; pinned-pinned `Mx = w·H²/8`, `Vy = w·H/2`;
+  cantilever (parapet) `Mx = w·H²/2`, `Vy = w·H`, `Kx = 2.1`.
 - **Unbraced lengths:** `Lx` = full height always; `Ly = Lt = Lm` set by bridging
   (`none / midpoint / third / quarter / 48in / 60in / 72in / custom`).
-- **Combos:** the 10 ASCE-7 ASD combinations; the governing unity check wins.
+- **Combos:** built-in `ASCE7-22_ASD` (default; §2.4.1 Eqs. 1a–7a + §2.4.5 Eqs.
+  8–10), `ASCE7-16_ASD`, or `IBC2024_ALT_ASD` (IBC §1605.2 Eqs. 16-1…16-6), each
+  row labelled with its code reference, plus optional `user_combos`
+  (`combo_mode = builtin | user | append`). Every combo is returned with P, M, V, UC.
+- **Load levels:** wind and snow default to **strength level** (the combos apply
+  0.6W, 0.7S and 0.1S); pass `wind_level="asd"` / `snow_level="asd"` if your inputs
+  are already ASD. Eh / Ev are strength level (Eh × D_wall lateral, Ev × D axial).
+  `load_level_factors` and each combo's `factors` echo exactly what was applied.
+- **Wind:** MWFRS pressures (`W_mwfw`, `W_mwfl`) combine with axial load; C&C
+  (`W_cc_w`, `W_cc_l`) are checked in bending alone and used for deflection.
+- **Roof:** each combo uses **one** of Lr / 0.7S / R — whichever governs — never
+  their sum.
 
 ---
 
@@ -224,21 +260,29 @@ simply-supported beam-column:
 
 - This tool reports exactly what CFS returns. If a section fails to load or a
   check errors, you get an honest error — never a fabricated pass.
-- **Serviceability (deflection) is not auto-checked** by the strength unity
-  checks. `find_equivalent_profiles` reports the stiffness (Ix) ratio so you can
-  judge deflection; run `check_stud` with `DxMax/DyMax`-style limits in CFS for a
-  formal L/240 etc. check.
+- **Deflection** (`check_stud`, `design_wall`, `design_stacked_wall`) uses the
+  CFS effective Ix at the service moment; C&C wind is taken as
+  `wind_defl_modifier × 0.6W` (default 0.7 → 0.42W, IBC Table 1604.3 note f) and
+  interior L_lat at 1.0. It is always reported (Δ and L/x); pass/fail only when
+  `defl_limit` is given. `find_equivalent_profiles` still reports only the Ix ratio.
+- **Limit-state strengths** (Pa-Dist, Ma-Brc, Ma-Dist, governing axial buckling
+  mode) are read from CFS's own calculation trace and reconciled against CFS's
+  member strength; a mismatch is flagged, never hidden.
+- **Web crippling** at the stud end uses CFS `WebCheck` with the maximum lateral
+  end reaction (`bearing_length_in`, default 1.0 in, fastened); UC > 1 is reported
+  as *stiffener required*.
 - A `.cfss` file with a **corrupt embedded date field** cannot be loaded by CFS —
   that is a data problem in the file, not the server; re-export it from CFS. The
   server reports the honest load error rather than skipping silently.
 - Custom `.cfss` files often carry a **stale embedded description**; the server
   therefore labels custom sections by **filename**, not the embedded description.
 - **Project structure**: server code lives in the `cfs_rsg_mcp/` package
-  (`server.py` tools · `cfs_engine.py` COM layer · `cfs_loads.py` load paths ·
-  `catalog.py` catalogs/parsing). Tests in `tests/` (`pytest -m "not live"` runs
+  (`server.py` tools · `jobs.py` COM job bodies · `watchdog.py` process isolation ·
+  `cfs_engine.py` COM layer · `cfs_loads.py` loads/combos · `stacked.py` stacked
+  walls · `catalog.py` catalogs/parsing). Tests in `tests/` (`pytest -m "not live"` runs
   without CFS; `pytest -m live` needs a licensed CFS 15).
 
 ---
 
-*Author: Hugo Velasco (Hugo VelP). Version 0.1.0 — developed; pending MCP-tester
+*Author: Hugo Velasco (Hugo VelP). Version 0.1.0 (maturity 0.1.0.3) — developed; pending MCP-tester
 and user validation before production use.*

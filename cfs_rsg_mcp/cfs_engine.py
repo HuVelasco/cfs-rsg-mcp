@@ -1,6 +1,6 @@
 # FILE: cfs_engine.py
 # PURPOSE: COM connection + core calculation wrapper for the RSG CFS15 Automation Module
-# STATUS: Version 0.1.0.1 - Developed (bug-fix pass from tester report); not yet re-validated
+# STATUS: Version 0.1.0.3 - Developed (production-issue fix pass); not yet MCP re-validated
 # AUTHOR: Hugo Velasco (Hugo VelP)
 #
 # This module is the ONLY place that talks to the CFS15 COM server. Everything
@@ -38,9 +38,13 @@ PROGID = "RSG.CFS15.Calculation"
 _NS = "RSG.CFS15."  # namespace prefix for helper classes (MemberParams, SectionForces...)
 
 # ---------------------------------------------------------------------------
-# Specifications (AISI). Default matches the user's wall-stud notebook.
+# Specifications (AISI).
+# Default = the CODE OF RECORD, not the newest edition: IBC 2024 (and IBC 2021,
+# BCNYS 2025) reference AISI S100-16 (2020) w/S2-20 -> CFS "AISI2016USASD".
+# Using AISI2024USASD overstated axial capacity in production by ~36%
+# (362SLS155-43 single, Ly=Lt=48": Pa 3.564 k vs 2.658 k; Simpson 2.629 k).
 # ---------------------------------------------------------------------------
-DEFAULT_SPEC = 42  # AISI2024USASD
+DEFAULT_SPEC = 27  # AISI2016USASD
 
 SPEC_BY_NAME: Dict[str, int] = {
     "AISI2016USASD": 27, "AISI2016USLRFD": 28,
@@ -50,6 +54,69 @@ SPEC_BY_NAME: Dict[str, int] = {
     "AISI2024CanLSD": 46,
 }
 SPEC_NAME_BY_ID: Dict[int, str] = {v: k for k, v in SPEC_BY_NAME.items()}
+
+
+# Building code -> referenced ASCE 7 edition and AISI S100 edition.
+BUILDING_CODES: Dict[str, Dict] = {
+    "IBC2024": {"asce": "7-22", "aisi_year": "2016",
+                "aisi_text": "AISI S100-16 (2020) w/S2-20"},
+    "BCNYS2025": {"asce": "7-22", "aisi_year": "2016",
+                  "aisi_text": "AISI S100-16 (2020) w/S2-20 (via IBC 2024)"},
+    "IBC2021": {"asce": "7-16", "aisi_year": "2016",
+                "aisi_text": "AISI S100-16 (2020) w/S2-20"},
+    "IBC2018": {"asce": "7-16", "aisi_year": "2016", "aisi_text": "AISI S100-16"},
+}
+BUILDING_CODE_ALIASES = {"NYSBC2025": "BCNYS2025", "2025BCNYS": "BCNYS2025"}
+DEFAULT_BUILDING_CODE = "IBC2024"
+
+
+def spec_name(spec_id: int) -> str:
+    return SPEC_NAME_BY_ID.get(int(spec_id), f"enum {spec_id}")
+
+
+def spec_info(spec_id: int) -> Dict:
+    """Echo of the specification actually used (always returned by the tools)."""
+    name = SPEC_NAME_BY_ID.get(int(spec_id))
+    m = re.match(r"AISI(\d{4})(US|Can)(ASD|LRFD|LSD)$", name or "")
+    return {"name": name or f"unknown (enum {spec_id})", "enum": int(spec_id),
+            "aisi_year": m.group(1) if m else None,
+            "method": m.group(3) if m else None,
+            "is_default": int(spec_id) == DEFAULT_SPEC}
+
+
+def spec_code_check(spec_id: int, building_code: Optional[str] = DEFAULT_BUILDING_CODE,
+                    asce_edition: Optional[str] = None,
+                    asd_combos: bool = False) -> Dict:
+    """Compare the spec (and ASCE edition) with the selected building code.
+
+    Returns {'warnings': [...], 'errors': [...], 'building_code': {...}}. An ASD
+    load combination set with an LRFD/LSD spec is an ERROR (the unity checks would
+    compare ASD loads with factored resistance - unconservative).
+    """
+    info = spec_info(spec_id)
+    warnings: List[str] = []
+    errors: List[str] = []
+    code = None
+    if building_code and str(building_code).strip().lower() not in ("none", ""):
+        key = str(building_code).strip().upper().replace(" ", "").replace("-", "")
+        key = BUILDING_CODE_ALIASES.get(key, key)
+        if key not in BUILDING_CODES:
+            raise ValueError(f"Unknown building_code {building_code!r}. Use one of "
+                             f"{sorted(BUILDING_CODES)} or 'none'.")
+        code = {"name": key, **BUILDING_CODES[key]}
+        if info["aisi_year"] != code["aisi_year"]:
+            warnings.append(
+                f"SPEC MISMATCH: {info['name']} is not the edition referenced by {key} "
+                f"({code['aisi_text']} -> CFS 'AISI{code['aisi_year']}USASD'). A newer "
+                f"edition can materially overstate capacity (e.g. 362SLS155-43 at "
+                f"48\" bracing: Pa 3.564 k under S100-24 vs 2.658 k under S100-16).")
+        if asce_edition and asce_edition != code["asce"]:
+            warnings.append(f"ASCE MISMATCH: asce_edition {asce_edition} but {key} "
+                            f"references ASCE 7-{code['asce'].split('-')[1]}.")
+    if asd_combos and info["method"] not in (None, "ASD"):
+        errors.append(f"The load combinations are ASD but the spec {info['name']} is "
+                      f"{info['method']}. Use an ASD spec (e.g. AISI2016USASD).")
+    return {"warnings": warnings, "errors": errors, "building_code": code, "spec": info}
 
 
 def resolve_spec(spec) -> int:
@@ -402,17 +469,20 @@ class _Session:
         f.Dy = float(Dy)
         return f
 
-    def member_strengths(self, spec: int, lengths: Dict, **overrides) -> Dict:
+    def member_strengths(self, spec: int, lengths: Dict,
+                         include_trace: bool = False, **overrides) -> Dict:
         """Member design strengths (P, Mx, My, Vy) at the given unbraced lengths.
 
         Runs MemberCheck with zero applied force; the returned MemberUnityCheck
         exposes the available member strengths (already accounting for global /
         distortional buckling at Lx/Ly/Lt/Lm).
+
+        include_trace: attach CFS's full calculation trace string under 'trace'.
         """
         mp = self._member_params(spec, lengths, **overrides)
         f = self._forces()
         chk = self.calc.MemberCheck(mp, f)
-        return {
+        out = {
             "P_k": _f(chk.P),
             "Mx_kin": _f(chk.Mx),
             "My_kin": _f(chk.My),
@@ -420,8 +490,12 @@ class _Session:
             "Vx_k": _f(chk.Vx),
             "flags": _decode_flags(int(chk.Flags)),
         }
+        if include_trace:
+            out["trace"] = _trace(chk)
+        return out
 
-    def member_check(self, spec: int, lengths: Dict, forces: Dict, **overrides) -> Dict:
+    def member_check(self, spec: int, lengths: Dict, forces: Dict,
+                     include_trace: bool = False, **overrides) -> Dict:
         """Full unity check for one set of applied forces.
 
         Honesty rules around CFS's UC sentinel (9.999):
@@ -477,7 +551,7 @@ class _Session:
         _handle_shear("MyVx", myvx, vx_cap, applied["Vx_k"])
 
         gov_label, gov_uc = max(governing, key=lambda kv: kv[1])
-        return {
+        out = {
             "PMxMy1": round(uc1, 4),
             "PMxMy2": round(uc2, 4),
             "MxVy": round(mxvy, 4),
@@ -493,6 +567,175 @@ class _Session:
             "flag_notes": describe_flags(flags),
             "warnings": warnings,
         }
+        if include_trace:
+            out["trace"] = _trace(chk)
+        return out
+
+    # -- detailed strengths / serviceability / web crippling ---------------
+    def strength_detail(self, spec: int, lengths: Dict, **overrides) -> Dict:
+        """Member strengths broken down by limit state, all from CFS.
+
+        The COM API exposes only the governing member P / Mx. The individual
+        limit states (global Pne, local Pnl, distortional Pnd, Mnl, Mnd) and the
+        safety factors are read from CFS's OWN calculation trace for the member
+        check - nothing is computed in Python. The parsed governing values are
+        reconciled against CFS's reported member P / Mx; any mismatch is flagged.
+
+        Returns Pa, Pa_dist, Ma, Ma_Fy (fully braced), Ma_brc (at the member's
+        bracing), Ma_dist, Va, Ae, the governing axial buckling mode and notes.
+        """
+        ms = self.member_strengths(spec, lengths, include_trace=True, **overrides)
+        fb = self.fully_braced_strength(spec)
+        parsed = parse_strength_trace(ms.get("trace"))
+        lrfd = spec_info(spec)["method"] in ("LRFD", "LSD")
+        notes: List[str] = []       # informational
+        warnings: List[str] = []    # the breakdown could not be verified
+
+        def avail(nominal, omega, phi):
+            if nominal is None:
+                return None
+            f = phi if lrfd else (1.0 / omega if omega else None)
+            return round(nominal * f, 5) if f else None
+
+        ax, fx = parsed.get("axial", {}), parsed.get("flex_x", {})
+        Pa_lg = avail(ax.get("Pnl"), ax.get("omega"), ax.get("phi"))
+        Pa_dist = avail(ax.get("Pnd"), ax.get("omega"), ax.get("phi"))
+        Pa_glob = avail(ax.get("Pne"), ax.get("omega"), ax.get("phi"))
+        Ma_brc = avail(fx.get("Mnl"), fx.get("omega"), fx.get("phi"))
+        Ma_dist = avail(fx.get("Mnd"), fx.get("omega"), fx.get("phi"))
+        if Ma_brc is None and fx.get("Mnl_is_fully_braced"):
+            Ma_brc = fb["Mnx_pos_kin"]
+            notes.append("CFS reports Fn = Fy for X-axis flexure (no global LTB "
+                         "reduction at this bracing): Ma-Brc = fully braced Ma-Fy.")
+
+        mode = None
+        if ax.get("Pnl") is not None and ax.get("Pnd") is not None:
+            if ax["Pnd"] < ax["Pnl"]:
+                mode = "distortional"
+            elif ax.get("Pne") is not None and ax["Pnl"] < 0.995 * ax["Pne"]:
+                mode = "local (local-global interaction, Pnl < Pne)"
+            else:
+                mode = "global (flexural / torsional / flexural-torsional)"
+
+        # Reconcile parsed limit states with CFS's governing member strengths.
+        def reconcile(label, parsed_vals, cfs_val):
+            vals = [v for v in parsed_vals if v is not None]
+            if not vals or not cfs_val:
+                warnings.append(f"{label}: limit-state breakdown not available from the "
+                                f"CFS trace; only the governing value is reported.")
+                return
+            if abs(min(vals) - cfs_val) > 0.01 * abs(cfs_val):
+                warnings.append(f"{label}: parsed CFS trace ({round(min(vals), 4)}) does "
+                                f"not reconcile with CFS member strength ({cfs_val}); "
+                                f"the member strength is authoritative - breakdown "
+                                f"shown for reference only.")
+        reconcile("Pa", [Pa_lg, Pa_dist], ms["P_k"])
+        reconcile("Ma", [Ma_brc, Ma_dist], ms["Mx_kin"])
+
+        return {
+            "Pa_k": ms["P_k"], "Pa_local_global_k": Pa_lg, "Pa_global_k": Pa_glob,
+            "Pa_dist_k": Pa_dist,
+            "Ma_kin": ms["Mx_kin"], "Ma_Fy_kin": fb["Mnx_pos_kin"],
+            "Ma_brc_kin": Ma_brc, "Ma_dist_kin": Ma_dist,
+            "Va_k": ms["Vy_k"], "My_a_kin": ms["My_kin"],
+            "Pa_fully_braced_k": fb["Pn_k"],
+            "Ae_fully_braced_in2": fb["Ae_in2"], "Ae_member_in2": ax.get("Ae"),
+            "axial_buckling_mode": mode,
+            "method": "LRFD (phi*Rn)" if lrfd else "ASD (Rn/Omega)",
+            "flags": sorted(set(ms["flags"]) | set(fb["flags"])),
+            "notes": notes,
+            "warnings": warnings,
+        }
+
+    def elastic_modulus(self) -> Optional[float]:
+        try:
+            return _f(self.calc.SectionData().E)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def effective_Ix(self, spec: int, Mx_kin: float) -> Optional[float]:
+        """CFS effective Ix (in^4) of the loaded section at the moment Mx_kin."""
+        ep = self.calc.EffectiveProperties(self._forces(Mx=float(Mx_kin)), int(spec))
+        return _f(ep.Ix)
+
+    def web_crippling(self, spec: int, P_k: float, bearing_length_in: float = 1.0,
+                      fastened: bool = True, Lend_in: float = 0.0,
+                      Lload_in: float = 10000.0, M_kin: float = 0.0) -> Dict:
+        """CFS WebCheck for a concentrated load / end reaction on the flange.
+
+        For a wall stud this is the lateral END REACTION bearing on the stud
+        flange at the track (Dir = 1: load along the web). Allowable reaction is
+        derived from CFS's own unity check (Pa = P / UC).
+        """
+        wp = _mk("WebParams")
+        wp.Spec = int(spec)
+        wp.Dir = 1
+        wp.Fastened = bool(fastened)
+        wp.Lend = float(Lend_in)
+        wp.Lload = float(Lload_in)
+        wp.M = float(M_kin)
+        wp.N = float(bearing_length_in)
+        wp.P = float(abs(P_k))
+        w = self.calc.WebCheck(wp)
+        uc = _f(w.P)
+        flags = _decode_flags(int(w.Flags))
+        return {"R_k": round(abs(P_k), 5), "UC": uc,
+                "UC_with_bending": _f(w.PM),
+                "Ra_k": round(abs(P_k) / uc, 4) if uc else None,
+                "stiffener_required": bool(uc is not None and uc > 1.0),
+                "bearing_length_in": bearing_length_in, "fastened": fastened,
+                "flags": flags, "flag_notes": describe_flags(flags)}
+
+
+# ---------------------------------------------------------------------------
+# CFS trace parsing (read CFS's own limit-state results; no calculation here)
+# ---------------------------------------------------------------------------
+_NUM = r"(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+_TRACE_KEYS = ("Pne", "Pnl", "Pnd", "Mne", "Mnl", "Mnd", "Ae")
+
+
+def parse_strength_trace(trace: Optional[str]) -> Dict:
+    """Pull the limit-state strengths out of a CFS MemberCheck trace.
+
+    Returns {'axial': {...}, 'flex_x': {...}, 'flex_y': {...}} with the first
+    Pne/Pnl/Pnd (axial) or Mne/Mnl/Mnd (flexure), Ae, and omega/phi of each
+    block. Missing values are simply absent - callers must not invent them.
+    """
+    out: Dict[str, Dict] = {}
+    if not trace:
+        return out
+    blocks: Dict[str, List[str]] = {}
+    current = None
+    for line in str(trace).splitlines():
+        if line and not line[0].isspace():
+            head = line.strip()
+            if head.startswith("Axial Compression Strength"):
+                current = "axial"
+            elif head.startswith("Flexural Strength about X"):
+                current = "flex_x"
+            elif head.startswith("Flexural Strength about Y"):
+                current = "flex_y"
+            else:
+                current = None
+            if current:
+                blocks[current] = []
+            continue
+        if current:
+            blocks[current].append(line)
+    for name, lines in blocks.items():
+        text = "\n".join(lines)
+        d: Dict = {}
+        for key in _TRACE_KEYS:
+            m = re.search(rf"\b{key}={_NUM}", text)
+            if m:
+                d[key] = float(m.group(1))
+        m = re.search(r"Ω[cb]=" + _NUM + r",\s*φ[cb]=" + _NUM, text)
+        if m:
+            d["omega"], d["phi"] = float(m.group(1)), float(m.group(2))
+        if "Fn = Fy, see fully braced strength" in text and "Mnl" not in d:
+            d["Mnl_is_fully_braced"] = True
+        out[name] = d
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +809,19 @@ def _decode_flags(flags: int) -> List[str]:
     if not flags:
         return []
     return [name for bit, name in _NOTE_FLAGS.items() if flags & bit]
+
+
+def _trace(chk) -> Optional[str]:
+    """Best-effort read of a CFS result object's Trace (detailed calc report).
+
+    Returns None if the build/object does not expose a Trace property so callers
+    that opt into include_trace never crash on an older CFS.
+    """
+    try:
+        t = chk.Trace
+        return str(t) if t is not None else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _f(v):

@@ -1,0 +1,206 @@
+Reduced section properties due to holes (global buckling)
+  A=0.48071 in², Ix=2.6808 in⁴, Iy=0.26452 in⁴, Ixy=0 in⁴
+  x₀=-1.4585 in, y₀=0 in, jx=3.1203 in, jy=0 in
+  r₀=2.873 in, J=0.00032592 in⁴, Cw=1.9564 in⁶
+P-δ effects
+  B₁x=1.0304	Eq. C1.2.1.1-3
+  B₁y=1.4269	Eq. C1.2.1.1-3
+Axial Compression Strength
+  σex=110.17 ksi	Eq. F2.1.2-2
+  σey=10.871 ksi	Eq. F2.1.1-4
+  σt=10.648 ksi	Eq. F2.1.1-5
+  Fcre=10.37 ksi	Eq. E2.2-1
+  Fy=33 ksi
+  λc=1.7839	Eq. E2-4
+  Fn=9.0945 ksi	Eq. E2-3
+  Pne=4.4743 k	Eq. E2-1
+  Local buckling (EWM)
+  Effective width calculations for Stud
+    Element 1: Unstiffened, w=0.5087 in
+      f₁=9.0945 ksi, f₂=9.0945 ksi
+      ψ=1	Eq. 1.2.2-1
+      k=0.43	Eq. 1.2.2-3
+      λ=0.31768	Eq. 1.1-3
+      λ<0.673 (fully effective)	Eq. 1.1-1
+    Element 2: Check for lip stiffener reduction
+      S=72.901	Eq. 1.3-7
+      Ia=1.5192e-5 in⁴	Eq. 1.3-8
+      Is=0.00049474 in⁴ > Ia (no lip reduction)
+      k=3.4819	Table 1.3-1
+    Element 2: Partially stiffened, w=1.7674 in
+      f=9.0945 ksi, k=3.4819
+      λ=0.38788	Eq. 1.1-3
+      λ<0.673 (fully effective)	Eq. 1.1-1
+    Element 3: Treat as two unstiffened elements
+      f₁=9.0945 ksi, f₂=9.0945 ksi
+      ψ=1	Eq. 1.2.2-1
+      k=0.43	Eq. 1.2.2-3
+      λ=1.3325	Eq. 1.1-3
+      ρ=0.62657	Eq. 1.1-2
+      b=1.3369 in (ineffective width=0.79679 in)	Eq. 1.1-1
+      f₁=9.0945 ksi, f₂=9.0945 ksi
+      ψ=1	Eq. 1.2.2-1
+      k=0.43	Eq. 1.2.2-3
+      λ=1.3325	Eq. 1.1-3
+      ρ=0.62657	Eq. 1.1-2
+      b=1.3369 in (ineffective width=0.79679 in)	Eq. 1.1-1
+    Element 5: Unstiffened, w=0.5087 in
+      f₁=9.0945 ksi, f₂=9.0945 ksi
+      ψ=1	Eq. 1.2.2-1
+      k=0.43	Eq. 1.2.2-3
+      λ=0.31768	Eq. 1.1-3
+      λ<0.673 (fully effective)	Eq. 1.1-1
+    Element 4: Check for lip stiffener reduction
+      S=72.901	Eq. 1.3-7
+      Ia=1.5192e-5 in⁴	Eq. 1.3-8
+      Is=0.00049474 in⁴ > Ia (no lip reduction)
+      k=3.4819	Table 1.3-1
+    Element 4: Partially stiffened, w=1.7674 in
+      f=9.0945 ksi, k=3.4819
+      λ=0.38788	Eq. 1.1-3
+      λ<0.673 (fully effective)	Eq. 1.1-1
+    Ae=0.35246 in²
+    Pnl=3.2054 k	Eq. E3.1-1
+    Ωc=1.8, φc=0.85
+  Distortional buckling for Stud elements 1 to 2
+    Af=0.11352 in², Ixf=0.0027095 in⁴, Iyf=0.046866 in⁴, Ixyf=0.0062278 in⁴
+    xof=-0.75255 in, yof=0.07166 in, Cwf=5.6017e-8 in⁶, Jf=7.6968e-5 in⁴
+    xhf=1.1956 in, ho=6 in, tweb=0.04223 in
+    Lcrd=22.326 in	Eq. 2.3.1.3-7
+    kφfe=0.099826 k	Eq. 2.3.1.3-3
+    kφwe=0.067819 k	Eq. 2.3.1.3-4
+    kφ=0 k
+    kφfg=0.0044402 in²	Eq. 2.3.1.3-5
+    kφwg=0.0030102 in²	Eq. 2.3.1.3-6
+    Fcrd=22.501 ksi	Eq. 2.3.1.3-2
+    Pcrd=11.07 k	Eq. 2.3.1.3-1
+    Py=16.235 k, Pynet=14.003 k
+    Pnd=10.339 k	Eq. E4.1-2
+    Ωc=1.8, φc=0.85
+
+Flexural Strength about X-axis
+  σey=10.871 ksi	Eq. F2.1.1-4
+  σt=10.648 ksi	Eq. F2.1.1-5
+  Cb=1	
+  Fcre=17.005 ksi	Eq. F2.1.1-1
+  Mcre=15.207 k-in
+  Fy=33 ksi
+  Fn=17.005 ksi	Eq. F2.1-5
+  Mne=15.207 k-in	Eq. F2.1-1
+  Local buckling (EWM)
+  Effective width calculations for Stud
+    Element 1: No compressive stress (fully effective)
+    Element 2: No compressive stress (fully effective)
+    Element 3: Stiffened, w=5.7674 in
+      f₁=16.345 ksi, f₂=-16.345 ksi
+      ψ=1	Eq. 1.1.2-1
+      k=24	Eq. 1.1.2-2
+      λ=0.64632	Eq. 1.1-3
+      ρ=1	Eq. 1.1-2
+      be=5.7674 in	Eq. 1.1-1
+      h₀=6 in, b₀=2 in, h₀/b₀=3
+      b₁=1.4418 in	Eq. 1.1.2-3
+      b₂=2.8837 in	Eq. 1.1.2-4
+      Compression width=2.8837 in
+      b₁+b₂ > compression width (fully effective)
+    Element 5: Unstiffened, w=0.5087 in
+      f₁=16.345 ksi, f₂=13.462 ksi
+      ψ=0.82359	Eq. 1.2.2-1
+      k=0.49674	Eq. 1.2.2-2
+      λ=0.39625	Eq. 1.1-3
+      λ<0.673 (fully effective)	Eq. 1.1-1
+    Element 4: Check for lip stiffener reduction
+      S=53.515	Eq. 1.3-7
+      Ia=0.00010908 in⁴	Eq. 1.3-8
+      Is=0.00049474 in⁴ > Ia (no lip reduction)
+      k=3.4819	Table 1.3-1
+    Element 4: Partially stiffened, w=1.7674 in
+      f=16.877 ksi, k=3.4819
+      λ=0.52838	Eq. 1.1-3
+      λ<0.673 (fully effective)	Eq. 1.1-1
+    Center of gravity shift: y=0 in
+    Sec=0.89007 in³
+    Mnl=15.135 k-in	Eq. F3.1-1
+    Ωb=1.67, φb=0.9
+  Distortional buckling for Stud elements 4 to 5
+    Af=0.11352 in², Ixf=0.0027095 in⁴, Iyf=0.046866 in⁴, Ixyf=-0.0062278 in⁴
+    xof=0.75255 in, yof=0.07166 in, Cwf=5.6014e-8 in⁶, Jf=7.6968e-5 in⁴
+    xhf=-1.1956 in, ho=6 in, tweb=0.041901 in
+    Lcrd=20.179 in	Eq. 2.3.3.3-4
+    kφfe=0.14486 k	Eq. 2.3.1.3-3
+    kφwe=0.10863 k	Eq. 2.3.3.3-5
+    kφ=0 k
+    kφfg=0.0054353 in²	Eq. 2.3.1.3-5
+    kφwg=0.00063166 in²	Eq. 2.3.3.3-6
+    Fcrd=41.781 ksi	Eq. 2.3.3.3-2
+    Mcrd=37.648 k-in	Eq. 2.3.3.3-1
+    Mnd=25.05 k-in	Eq. F4.1-2
+    Ωb=1.67, φb=0.9
+
+Flexural Strength about Y-axis
+  σex=110.17 ksi	Eq. F2.1.2-2
+  σt=10.648 ksi	Eq. F2.1.1-5
+  Ctf=1	
+  Fcre=36.063 ksi	Eq. F2.1.2-1
+  Mcre=6.7922 k-in
+  Fy=37.247 ksi
+  Fn=29.512 ksi	Eq. F2.1-4
+  Mne=5.5584 k-in	Eq. F2.1-1
+  Local buckling (EWM)
+  Effective width calculations for Stud
+    Element 1: Unstiffened, w=0.5087 in
+      f₁=29.015 ksi, f₂=29.015 ksi
+      ψ=1	Eq. 1.2.2-1
+      k=0.43	Eq. 1.2.2-3
+      λ=0.56743	Eq. 1.1-3
+      λ<0.673 (fully effective)	Eq. 1.1-1
+    Element 2: Stiffened, w=1.7674 in
+      f₁=26.946 ksi, f₂=-12.048 ksi
+      ψ=0.4471	Eq. 1.1.2-1
+      k=12.955	Eq. 1.1.2-2
+      λ=0.34613	Eq. 1.1-3
+      ρ=1	Eq. 1.1-2
+      be=1.7674 in	Eq. 1.1-1
+      h₀=2 in, b₀=0.625 in, h₀/b₀=3.2
+      b₁=0.51272 in	Eq. 1.1.2-3
+      b₂=0.8837 in	Eq. 1.1.2-4
+      Compression width=1.2213 in
+      b₁+b₂ > compression width (fully effective)
+    Element 3: No compressive stress (fully effective)
+    Element 5: Unstiffened, w=0.5087 in
+      f₁=29.015 ksi, f₂=29.015 ksi
+      ψ=1	Eq. 1.2.2-1
+      k=0.43	Eq. 1.2.2-3
+      λ=0.56743	Eq. 1.1-3
+      λ<0.673 (fully effective)	Eq. 1.1-1
+    Element 4: Stiffened, w=1.7674 in
+      f₁=26.946 ksi, f₂=-12.048 ksi
+      ψ=0.4471	Eq. 1.1.2-1
+      k=12.955	Eq. 1.1.2-2
+      λ=0.34613	Eq. 1.1-3
+      ρ=1	Eq. 1.1-2
+      be=1.7674 in	Eq. 1.1-1
+      h₀=2 in, b₀=0.625 in, h₀/b₀=3.2
+      b₁=0.51272 in	Eq. 1.1.2-3
+      b₂=0.8837 in	Eq. 1.1.2-4
+      Compression width=1.2213 in
+      b₁+b₂ > compression width (fully effective)
+    Center of gravity shift: x=0.087978 in
+    Sec=0.18287 in³
+    Mnl=5.3968 k-in	Eq. F3.1-1
+    Ωb=1.67, φb=0.9
+  Distortional buckling for Stud elements 1 to 2
+    Af=0.11352 in², Ixf=0.0027095 in⁴, Iyf=0.046866 in⁴, Ixyf=0.0062278 in⁴
+    xof=-0.75255 in, yof=0.07166 in, Cwf=5.6017e-8 in⁶, Jf=7.6968e-5 in⁴
+    xhf=1.1956 in, ho=6 in, tweb=0.042047 in
+    Lcrd=21.071 in	S100-22 Eq. 2.3.3.2-8
+    kφfe=0.12345 k	Eq. 2.3.1.3-3
+    kφwe=0.091789 k	S100-22 Eq. 2.3.3.2-9
+    kφ=0 k
+    kφfg=0.0036197 in²	S100-22 Eq. 2.3.3.2-10
+    kφwg=0 in²	
+    Fcrd=59.463 ksi	Eq. 2.3.3.3-2
+    Mcrd=11.199 k-in	Eq. 2.3.3.3-1
+    Mnd=5.8142 k-in	Eq. F4.2-2
+    Ωb=1.67, φb=0.9
+

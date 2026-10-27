@@ -1,7 +1,7 @@
 # FILE: server.py
 # PURPOSE: RSG CFS15 MCP server - cold-formed steel wall-stud design + profile
 #          equivalency, driving the CFS15 Automation Module over COM.
-# STATUS: Version 0.1.0.1 - Developed (bug-fix pass from tester report); not yet re-validated
+# STATUS: Version 0.1.0.3 - Developed (production-issue fix pass); not yet MCP re-validated
 # AUTHOR: Hugo Velasco (Hugo VelP)
 #
 # ============================================================================
@@ -13,7 +13,7 @@
 # section fails to load or a check errors, the tool returns an honest error, it
 # never fabricates a passing result.
 #
-# UNITS: kips, kip-inches, inches, ksi. Spacing/height as noted per tool.
+# UNITS: kips, kip-inches, inches, ksi; area loads psf, line loads plf.
 #
 # WHAT A "SECTION" CAN BE (accepted by every tool's `section` argument):
 #   * An SSMA designation ...... "600S200-43"   (resolved from the bundled SSMA
@@ -23,38 +23,63 @@
 #
 # TYPICAL WORKFLOWS
 #   Design a wall with standard studs:
-#     design_wall(height_ft=10, spacing_in=16, D_A=..., L_A=..., W_cc_w=...)
-#   Find custom profiles equivalent to a standard spec (the headline feature):
+#     design_wall(height_ft=10, spacing_in=16, wall_type="exterior", D_A=..., W_cc_w=...)
+#   Design a multi-storey stacked wall:
+#     design_stacked_wall(levels=[{...top...}, {...}, {...bottom...}], wall_type=...)
+#   Find custom profiles equivalent to a standard spec:
 #     find_equivalent_profiles(standard="600S200-43", height_ft=10, spacing_in=16)
-#   Inspect one profile:
-#     get_section_properties("600S200-43")
 #
-# SPEC: defaults to AISI2024USASD (enum 42). Pass spec="AISI2022USASD" or an int.
+# SPEC: defaults to AISI2016USASD (enum 27) = AISI S100-16 (2020) w/S2-20, the
+# edition referenced by IBC 2024 / IBC 2021 / BCNYS 2025. Every tool echoes the
+# spec used and warns when it does not match `building_code`.
+#
+# WATCHDOG: the COM-heavy tools run CFS in an isolated child process with a
+# per-call timeout (timeout_s, default 60 s / CFS_MCP_TIMEOUT_S). A hung engine
+# is killed and restarted on the next call; partial results are returned.
 # ============================================================================
 
 from __future__ import annotations
 
 import json
-import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from . import catalog
+from . import catalog, jobs, stacked, substitution, watchdog
 from .cfs_engine import (
+    DEFAULT_BUILDING_CODE,
     DEFAULT_SPEC,
     SPEC_NAME_BY_ID,
     CFSError,
-    cfs_install_dir,
     cfs_session,
-    describe_flags,
     parse_designation,
     resolve_spec,
     section_label,
+    spec_code_check,
 )
-from .cfs_loads import build_load_combinations, unbraced_lengths
+from .cfs_loads import (
+    build_combo_table,
+    combo_defs_for,
+    combos_from_effects,
+    deflection_cases,
+    effective_length_factors,
+    load_level_factors,
+    require_wall_type,
+    resolve_axial_force,
+    resolve_combo_options,
+    unbraced_lengths,
+)
 
 mcp = FastMCP("cfs-rsg-mcp")
+
+# Back-compat aliases (these helpers now live in jobs.py so the watchdog's child
+# process can import them without FastMCP).
+_evaluate = jobs.evaluate_section
+_ratio = jobs.ratio
+_member_lengths = jobs.member_lengths
+_force_unit_warnings = jobs.force_unit_warnings
+_P_SANITY_K = jobs.P_SANITY_K
+_M_SANITY_KIN = jobs.M_SANITY_KIN
 
 
 def _ok(**kw) -> str:
@@ -65,65 +90,146 @@ def _err(msg, **kw) -> str:
     return json.dumps({"success": False, "error": msg, **kw}, indent=2, default=str)
 
 
-# ---------------------------------------------------------------------------
-# Internal: evaluate one section inside an open session
-# ---------------------------------------------------------------------------
-def _evaluate(session, identifier, spec, lengths, grade=None, fy=None):
-    """Load a section and gather gross props + member strengths at `lengths`.
+def _spec_str(spec_id: int) -> str:
+    return f"{SPEC_NAME_BY_ID.get(spec_id, 'unknown')} (enum {spec_id})"
 
-    Returns a result dict; on failure returns {'error': ...} instead of raising,
-    so a batch loop can continue past a bad section.
-    """
-    label = os.path.splitext(os.path.basename(identifier))[0] if identifier else identifier
-    try:
-        path = session.load(identifier, grade=grade, fy=fy)
-    except CFSError as e:
-        return {"section": label, "error": str(e)}
-    try:
-        sd = session.section_data()
-        gp = session.gross_properties()
-        ms = session.member_strengths(spec, lengths)
-        return {
-            "section": section_label(path, sd.get("description")),
-            "identifier": identifier,
-            "load_path": path,
-            "section_type": sd.get("section_type_name"),
-            "Fy_ksi": sd.get("Fy_ksi"),
-            "gross": gp,
-            "member_strength": ms,
-        }
-    except Exception as e:  # noqa: BLE001
-        return {"section": label, "error": f"Calculation failed: {e}"}
+
+def _job_error(jr: "watchdog.JobResult", **context) -> str:
+    """Honest failure from a watchdog job, with whatever finished before it."""
+    return _err(jr.error or "CFS job failed.", timed_out=jr.timed_out,
+                partial_results=jr.partial, watchdog=jr.diagnostics(), **context)
+
+
+def _doc(extra: str):
+    """Append a shared documentation block to a tool docstring (before @mcp.tool)."""
+    def deco(fn):
+        fn.__doc__ = (fn.__doc__ or "") + extra
+        return fn
+    return deco
+
+
+LOAD_CONVENTIONS_DOC = """
+    LOAD INPUTS (unsigned magnitudes; the combos assign every sign)
+      D_wall            wall self-weight, psf of wall face
+      D_A / D_B         dead load, side A / side B, psf (side B ignored for exterior)
+      L_A / L_B         floor live load, side A / side B, psf
+      L_lat             interior lateral live load, IBC 1607.15, psf. Part of L ->
+                        it is in the "D + L" combo and factored 0.75 with L.
+      Lr / S / R        roof live / snow / rain, psf over trib_A + trib_B (exterior:
+                        trib_A only) - the same tributary rule as D and L. They are
+                        NEVER summed: each combo uses "Lr or 0.7S or R", whichever
+                        governs, and says which one it used (roof_term).
+      W_mwfw / W_mwfl   MWFRS windward / leeward pressure, psf. COMBINED with axial
+                        load: Eqs. 5a, 6a, 7a.
+      W_cc_w / W_cc_l   C&C pressure, psf. BENDING ALONE (P = 0) and DEFLECTION.
+      W_uplift          MWFRS roof uplift, psf over the roof tributary; subtracts
+                        axial load in 0.6D + 0.6W (Eq. 7a) only.
+      Eh                seismic out-of-plane coefficient (strength level):
+                        lateral = Eh x D_wall (Fp/Ww, ASCE 7-22 12.11.1).
+      Ev                seismic vertical coefficient 0.2*SDS (strength level):
+                        axial = Ev x (total dead axial load).
+      line_loads        {D, L, Lr, S, R} plf at the top of the wall (e.g. parapet D).
+      point_loads       {D, L, Lr, S, R} kips PER STUD at the top of the wall.
+
+    LOAD LEVELS
+      wind_level  'strength' (default) -> combos apply 0.6W.  'asd' -> W used at 1.0.
+      snow_level  'strength' (default for 7-22) -> 0.7S in Eqs. 3a/4a/6a, 0.1S in
+                  Eq. 9.  'asd' -> 0.7 already applied; Eq. 9 uses 0.1/0.7 = 0.143.
+                  (ASCE 7-16 snow is nominal -> default 'asd' for 7-16.)
+      Eh, Ev      always strength level; combos apply 0.7 / 0.525.
+      Output `load_level_factors` + each combo's `factors` echo exactly what
+      multiplied each input.
+
+    COMBINATIONS
+      combo_set   'ASCE7-22_ASD' (default; Eqs. 1a-7a of 2.4.1 + Eqs. 8-10 of 2.4.5),
+                  'ASCE7-16_ASD', 'IBC2024_ALT_ASD' (IBC 1605.2 Eqs. 16-1..16-6).
+      combo_mode  'builtin' (default) | 'user' | 'append' (user combos after built-in).
+      user_combos [{"label": str, "factors": {"D": 1, "L": 1, "L_lat": 1, ...}}]
+                  keys D, L, L_lat, Lr, S, R, W_mwfw, W_mwfl, W_cc_w, W_cc_l,
+                  W_uplift, Eh, Ev; missing keys = 0; unknown keys are rejected.
+                  Factors multiply the inputs EXACTLY - no hidden 0.6 or 0.7.
+      asce_edition '7-22' (default) | '7-16'.
+      axial_at    'base' (default, full wall self-weight) | 'mid_height' (half of
+                  the wall's own weight subtracted, as Simpson does).
+
+    SUPPORT / SERVICEABILITY
+      support     'pinned-pinned' (default: M = wH^2/8, V = wH/2, K = 1) |
+                  'cantilever' (fixed-free parapet: M = wH^2/2, V = wH, Kx = 2.1).
+      defl_limit  L/x limit for lateral deflection (e.g. 240, 360, 600). Deflection
+                  is always reported; pass/fail only when a limit is given.
+      wind_defl_modifier  factor on the ASD C&C pressure for deflection (default
+                  0.7 -> 0.7 x 0.6W = 0.42W, IBC Table 1604.3 note f).
+      bearing_length_in   stud end bearing length for web crippling (default 1.0).
+
+    SPEC / CODE
+      spec        default AISI2016USASD (= AISI S100-16 (2020) w/S2-20).
+      building_code  'IBC2024' (default) | 'BCNYS2025' | 'IBC2021' | 'IBC2018' | 'none'.
+                  A spec or ASCE edition that does not match the code -> WARNING.
+                  An LRFD spec with these ASD combos -> ERROR.
+      timeout_s   watchdog timeout per call (default 60 s).
+"""
+
+
+# ---------------------------------------------------------------------------
+# Shared preparation
+# ---------------------------------------------------------------------------
+def _prep_spec(spec, building_code, asce_edition, asd_combos):
+    """-> (spec_id, check) or raises ValueError."""
+    spec_id = resolve_spec(spec)
+    chk = spec_code_check(spec_id, building_code, asce_edition, asd_combos)
+    if chk["errors"]:
+        raise ValueError(" ".join(chk["errors"]))
+    return spec_id, chk
+
+
+def _spec_fields(spec_id, chk) -> Dict:
+    return {"spec": _spec_str(spec_id), "spec_used": chk["spec"],
+            "building_code": chk["building_code"]}
+
+
+def _member_ctx(spec_id, lengths, kf, combos, height_ft, spacing_in, support,
+                defl, defl_limit, bearing_length_in, include_trace=False,
+                grade=None, fy=None, emit_combo_partials=False) -> Dict:
+    return {"spec_id": spec_id, "lengths": lengths, "k_factors": kf, "combos": combos,
+            "height_ft": height_ft, "spacing_in": spacing_in, "support": support,
+            "defl_cases": defl, "defl_limit": defl_limit,
+            "bearing_length_in": bearing_length_in, "web_fastened": True,
+            "include_trace": include_trace, "grade": grade, "fy": fy,
+            "emit_combo_partials": emit_combo_partials}
+
+
+def _support_notes(support, brace_config, kf) -> List[str]:
+    if support != "cantilever":
+        return []
+    if kf["Ky"] == 1.0:
+        why = (f"Ky = Kt = 1.0 assumes the bracing ({brace_config}) restrains weak-axis "
+               f"and torsional buckling of each braced segment - confirm for the parapet")
+    else:
+        why = "no intermediate bracing: the full free height uses K = 2.1 on all axes"
+    return [f"Cantilever (fixed-free) stud: Kx = {kf['Kx']}, Ky = Kt = {kf['Ky']} ({why}). "
+            f"Moment and axial are taken at the fixed base."]
 
 
 # ---------------------------------------------------------------------------
 # 1. Connection / status
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def connect_cfs() -> str:
+def connect_cfs(timeout_s: Optional[float] = None) -> str:
     """Check the CFS15 Automation Module connection and license.
 
     Returns license status, the CFS install directory, the default design
     specification, and the available section libraries. Call this first if
-    anything else errors, to isolate connection/license problems.
+    anything else errors, to isolate connection/license problems. Runs under the
+    watchdog, so a hung engine is reported instead of hanging the server.
     """
-    try:
-        with cfs_session():
-            install = cfs_install_dir()
-            libs = []
-            if install:
-                libs = [os.path.basename(p) for p in
-                        __import__("glob").glob(os.path.join(install, "*.cfsl"))]
-            return _ok(
-                message="Connected to RSG CFS15. License is active.",
-                install_dir=install,
-                default_spec=f"{SPEC_NAME_BY_ID.get(DEFAULT_SPEC)} (enum {DEFAULT_SPEC})",
-                libraries=libs,
-            )
-    except CFSError as e:
-        return _err(str(e))
-    except Exception as e:  # noqa: BLE001
-        return _err(f"Unexpected error connecting to CFS: {e}")
+    jr = watchdog.run(jobs.connect_job, {}, timeout_s, "connect_cfs")
+    if not jr.ok:
+        return _job_error(jr)
+    return _ok(message="Connected to RSG CFS15. License is active.",
+               install_dir=jr.result["install_dir"],
+               default_spec=f"{_spec_str(DEFAULT_SPEC)} = AISI S100-16 (2020) w/S2-20",
+               default_building_code=DEFAULT_BUILDING_CODE,
+               libraries=jr.result["libraries"], watchdog=jr.diagnostics())
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +309,21 @@ def list_custom_profiles(directory: Optional[str] = None,
 @mcp.tool()
 def get_section_properties(section: str, spec=None,
                            fy: Optional[float] = None,
-                           grade: Optional[int] = None) -> str:
+                           grade: Optional[int] = None,
+                           building_code: Optional[str] = DEFAULT_BUILDING_CODE) -> str:
     """Get gross section properties and fully-braced strengths for one section.
 
     section: SSMA designation ('600S200-43'), .cfss file path, or library path.
-    spec:    AISI spec (name or int enum). Default AISI2024USASD.
+    spec:    AISI spec (name or int enum). Default AISI2016USASD
+             (= AISI S100-16 (2020) w/S2-20, referenced by IBC 2024).
     fy:      override yield strength (ksi) after loading (forces carbon steel).
     grade:   for standard designations, force 33 or 50 ksi library folder.
+    building_code: warns if the spec does not match ('none' to skip).
     """
-    spec_id = resolve_spec(spec)
+    try:
+        spec_id, chk = _prep_spec(spec, building_code, None, False)
+    except ValueError as e:
+        return _err(str(e))
     try:
         with cfs_session() as s:
             path = s.load(section, grade=grade, fy=fy)
@@ -221,10 +333,11 @@ def get_section_properties(section: str, spec=None,
             return _ok(
                 section=section_label(path, sd.get("description")),
                 load_path=path,
-                spec=f"{SPEC_NAME_BY_ID.get(spec_id)} (enum {spec_id})",
+                **_spec_fields(spec_id, chk),
                 section_data=sd,
                 gross_properties=gp,
                 fully_braced_strength=st,
+                warnings=chk["warnings"],
             )
     except CFSError as e:
         return _err(str(e))
@@ -236,77 +349,126 @@ def get_section_properties(section: str, spec=None,
 # 6. Check a single stud
 # ---------------------------------------------------------------------------
 @mcp.tool()
+@_doc(LOAD_CONVENTIONS_DOC)
 def check_stud(section: str, height_ft: float, spacing_in: float = 16.0,
-               brace_config: str = "none", custom_n: Optional[int] = None,
+               brace_config: str = "none", brace_n: Optional[int] = None,
                spec=None, grade: Optional[int] = None, fy: Optional[float] = None,
                # explicit forces (override load-combo generation if any is set):
                P_k: Optional[float] = None, Mx_kin: Optional[float] = None,
-               Vy_k: Optional[float] = None,
+               Vy_k: Optional[float] = None, force_type: str = "auto",
                # OR provide PSF loads to auto-build ASD combos:
                loads: Optional[dict] = None,
                trib_A_ft: float = 0.0, trib_B_ft: float = 0.0,
-               wall_type: str = "exterior") -> str:
+               wall_type: Optional[str] = None, include_trace: bool = False,
+               asce_edition: str = "7-22", snow_level: Optional[str] = None,
+               wind_level: str = "strength", combo_set: Optional[str] = None,
+               combo_mode: str = "builtin", user_combos: Optional[List[dict]] = None,
+               axial_at: str = "base", support: str = "pinned-pinned",
+               line_loads: Optional[dict] = None, point_loads: Optional[dict] = None,
+               defl_limit: Optional[float] = None, wind_defl_modifier: float = 0.7,
+               bearing_length_in: float = 1.0,
+               building_code: Optional[str] = DEFAULT_BUILDING_CODE,
+               timeout_s: Optional[float] = None) -> str:
     """Run an AISI member check on ONE stud section.
 
     Two modes:
-      * Explicit forces - pass any of P_k / Mx_kin / Vy_k for a single check.
-      * Load combos     - pass a `loads` PSF dict (keys like D_A, L_A, S,
-                          W_cc_w, W_mwfw, Eh...) plus tributary widths; the tool
-                          builds the 10 ASD combos and reports the governing one.
+      * Explicit forces - pass any of P_k / Mx_kin / Vy_k (kips, kip-in) for a
+                          single check. No combos, no load-level factors.
+      * Load combos     - pass a `loads` PSF dict (keys D_wall, D_A, D_B, L_A, L_B,
+                          L_lat, Lr, S, R, W_mwfw, W_mwfl, W_cc_w, W_cc_l, W_uplift,
+                          Eh, Ev) plus tributary widths and wall_type (REQUIRED in
+                          this mode). Unknown keys are rejected, never ignored.
 
-    brace_config: none|midpoint|third|quarter|48in|60in|72in|custom (needs custom_n).
-    Returns per-combo unity checks and the governing UC (PASS if <= 1.0).
+    AXIAL SIGN CONVENTION (explicit-force mode): CFS15 is compression-POSITIVE.
+      force_type='compression' -> the P_k MAGNITUDE is compression.
+      force_type='tension'     -> the P_k magnitude is tension.
+      force_type='auto'        -> sign as given; P_k<0 returns a WARNING.
+
+    brace_config: none|midpoint|third|quarter|48in|60in|72in|custom (custom needs
+    brace_n = number of equal unbraced segments; bracing only, never capacity).
+
+    OUTPUT: every combo with P, M, V and UC (not only the governing one); the
+    governing combo; section properties (A, Ix, Sx, Ae); strengths by limit state
+    (Pa, Pa-Dist, Ma-Fy, Ma-Brc, Ma-Dist, Va) and the governing axial buckling
+    mode, read from CFS's own trace; web crippling at the stud end (stiffener
+    required?); lateral deflection with L/x; the spec used; load-level factors.
     """
-    spec_id = resolve_spec(spec)
     try:
-        lengths = unbraced_lengths(height_ft, brace_config, custom_n)
+        spec_id, chk = _prep_spec(spec, building_code, asce_edition, P_k is None
+                                  and Mx_kin is None and Vy_k is None)
+        lengths = unbraced_lengths(height_ft, brace_config, brace_n)
+        kf = effective_length_factors(support, brace_config)
     except ValueError as e:
         return _err(str(e))
 
+    warnings: List[str] = list(chk["warnings"])
     explicit = any(v is not None for v in (P_k, Mx_kin, Vy_k))
+    table = None
+    defl = []
     if explicit:
-        combos = [{"combo": 1, "label": "explicit forces",
-                   "P_k": P_k or 0.0, "Mx_kin": Mx_kin or 0.0, "Vy_k": Vy_k or 0.0}]
+        try:
+            P_signed, w = resolve_axial_force(P_k, force_type)
+        except ValueError as e:
+            return _err(str(e))
+        warnings += w
+        if loads:
+            warnings.append("Explicit forces were given, so `loads` was NOT used.")
+        combos = [{"combo": "explicit", "label": "explicit forces",
+                   "P_k": P_signed or 0.0, "Mx_kin": Mx_kin or 0.0, "Vy_k": Vy_k or 0.0}]
     else:
-        geom = {"height_ft": height_ft, "spacing_in": spacing_in,
-                "trib_A_ft": trib_A_ft, "trib_B_ft": trib_B_ft, "wall_type": wall_type}
-        combos = build_load_combinations(loads or {}, geom)
+        geom = {"height_ft": height_ft, "spacing_in": spacing_in, "trib_A_ft": trib_A_ft,
+                "trib_B_ft": trib_B_ft, "wall_type": wall_type, "support": support}
+        try:
+            table = build_combo_table(
+                loads or {}, geom, asce_edition=asce_edition, snow_level=snow_level,
+                wind_level=wind_level, combo_set=combo_set, combo_mode=combo_mode,
+                user_combos=user_combos, axial_at=axial_at, line_loads=line_loads,
+                point_loads=point_loads)
+        except ValueError as e:
+            return _err(str(e))
+        combos = table["combos"]
+        warnings += table["warnings"]
+        defl = deflection_cases(table["unfactored_effects"]["lateral_psf"],
+                                table["options"]["wind_level"], wind_defl_modifier)
+    warnings += _support_notes(support, brace_config, kf)
 
-    try:
-        with cfs_session() as s:
-            path = s.load(section, grade=grade, fy=fy)
-            sd = s.section_data()
-            rows, gov_uc, gov = [], -1.0, None
-            for c in combos:
-                chk = s.member_check(spec_id, lengths, c)
-                row = {"combo": c["combo"], "label": c["label"],
-                       "P_k": c["P_k"], "Mx_kin": c["Mx_kin"], "Vy_k": c["Vy_k"],
-                       "PMxMy1": chk["PMxMy1"], "PMxMy2": chk["PMxMy2"],
-                       "MxVy": chk["MxVy"], "UC": chk["UC"], "status": chk["status"]}
-                rows.append(row)
-                if chk["UC"] > gov_uc:
-                    gov_uc, gov = chk["UC"], row
-            return _ok(
-                section=section_label(path, sd.get("description")), load_path=path,
-                spec=f"{SPEC_NAME_BY_ID.get(spec_id)} (enum {spec_id})",
-                height_ft=height_ft, spacing_in=spacing_in,
-                brace_config=brace_config, unbraced_lengths_in=lengths,
-                passed=gov_uc <= 1.0, governing_UC=round(gov_uc, 4),
-                governing_combo=gov, combos=rows,
-            )
-    except CFSError as e:
-        return _err(str(e))
-    except Exception as e:  # noqa: BLE001
-        return _err(f"Check failed for '{section}': {e}")
+    ctx = _member_ctx(spec_id, lengths, kf, combos, height_ft, spacing_in, support,
+                      defl, defl_limit, bearing_length_in, include_trace, grade, fy,
+                      emit_combo_partials=True)
+    jr = watchdog.run(jobs.check_sections_job, {"sections": [section], "ctx": ctx},
+                      timeout_s, "check_stud")
+    common = dict(**_spec_fields(spec_id, chk), height_ft=height_ft, spacing_in=spacing_in,
+                  support=support, brace_config=brace_config, unbraced_lengths_in=lengths,
+                  effective_length_factors=kf)
+    if not jr.ok:
+        return _job_error(jr, **common, warnings=warnings)
+    rec = jr.result["records"][0]
+    if rec.get("error"):
+        return _err(rec["error"], **common)
+    gov = next((r for r in rec["combos"] if r["combo"] == rec["governing_combo"]), None)
+    return _ok(
+        section=rec["section"], load_path=rec["load_path"], **common,
+        force_type=force_type if explicit else None,
+        passed=rec["passed"], passed_strength=rec["passed_strength"],
+        governing_UC=rec["governing_UC"], governing_combo=gov,
+        combos=rec["combos"],
+        properties=rec["properties"], strengths=rec["strengths"],
+        web_crippling=rec["web_crippling"], deflection=rec["deflection"],
+        flags=rec["flags"], flag_notes=rec["flag_notes"],
+        load_level_factors=table["load_level_factors"] if table else
+        {"note": "explicit forces - applied exactly as given, no load factors"},
+        unfactored_effects=table["unfactored_effects"] if table else None,
+        warnings=warnings + rec["warnings"], watchdog=jr.diagnostics(),
+    )
 
 
 # ---------------------------------------------------------------------------
 # 7. Design a wall - pick the lightest passing section
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def design_wall(height_ft: float = 10.0, spacing_in: float = 16.0,
-                brace_config: str = "third", custom_n: Optional[int] = None,
-                wall_type: str = "exterior",
+@_doc(LOAD_CONVENTIONS_DOC)
+def design_wall(height_ft: float, spacing_in: float, wall_type: str,
+                brace_config: str = "third", brace_n: Optional[int] = None,
                 trib_A_ft: float = 0.0, trib_B_ft: float = 0.0,
                 # candidate sections: explicit list, custom folder, or SSMA depth
                 sections: Optional[List[str]] = None,
@@ -314,13 +476,25 @@ def design_wall(height_ft: float = 10.0, spacing_in: float = 16.0,
                 ssma_depth_in: Optional[float] = None,
                 structural_only: bool = True,
                 spec=None,
-                # ASD loads (PSF) - anything omitted defaults to 0 (D_wall=12):
+                # loads (PSF) - anything omitted defaults to 0 (D_wall=12):
                 D_wall: float = 12.0, D_A: float = 0.0, L_A: float = 0.0,
                 D_B: float = 0.0, L_B: float = 0.0, S: float = 0.0,
                 W_uplift: float = 0.0, W_mwfw: float = 0.0, W_mwfl: float = 0.0,
                 W_cc_w: float = 0.0, W_cc_l: float = 0.0, L_lat: float = 0.0,
-                Eh: float = 0.0, Ev: float = 0.0) -> str:
-    """Design a wall stud: try candidate sections, return the lightest that passes.
+                Eh: float = 0.0, Ev: float = 0.0,
+                Lr: float = 0.0, R: float = 0.0,
+                asce_edition: str = "7-22", snow_level: Optional[str] = None,
+                wind_level: str = "strength", combo_set: Optional[str] = None,
+                combo_mode: str = "builtin", user_combos: Optional[List[dict]] = None,
+                axial_at: str = "base", support: str = "pinned-pinned",
+                line_loads: Optional[dict] = None, point_loads: Optional[dict] = None,
+                defl_limit: Optional[float] = None, wind_defl_modifier: float = 0.7,
+                bearing_length_in: float = 1.0,
+                building_code: Optional[str] = DEFAULT_BUILDING_CODE,
+                timeout_s: Optional[float] = None) -> str:
+    """Design a wall stud: try candidate sections in order, return the first
+    (lightest, for SSMA auto-lists) that passes strength AND deflection (when
+    defl_limit is set).
 
     Candidate sections (choose one source):
       * sections          - explicit list of designations / .cfss paths (in order)
@@ -329,21 +503,23 @@ def design_wall(height_ft: float = 10.0, spacing_in: float = 16.0,
                              ordered thinnest->thickest (e.g. 6.0)
     If none is given, defaults to SSMA 6" structural studs.
 
-    structural_only (default True): when auto-building from SSMA, skip
-    non-structural drywall studs (S125 / 1-1/4" flange) so a load-bearing wall is
-    never designed with a partition-only gauge. Set False to include them.
+    wall_type ('interior' | 'exterior') is REQUIRED - never silently defaulted.
+    structural_only (default True): skip SSMA non-structural (S125) studs.
 
-    Loads are ASD PSF values; tributary widths in feet. The tool builds the 10
-    ASCE-7 ASD combos and checks every combo. Returns the first passing section
-    plus a summary of all sections tried.
+    OUTPUT: `selected` carries the full check of the chosen section (every combo
+    with P, M, V, UC; properties; limit-state strengths; web crippling;
+    deflection); `sections_tried` summarizes every section evaluated;
+    `load_combinations` is the full combo table with its factors. If the watchdog
+    times out, the sections finished so far are returned as partial_results.
     """
-    spec_id = resolve_spec(spec)
     try:
-        lengths = unbraced_lengths(height_ft, brace_config, custom_n)
+        require_wall_type(wall_type)
+        spec_id, chk = _prep_spec(spec, building_code, asce_edition, True)
+        lengths = unbraced_lengths(height_ft, brace_config, brace_n)
+        kf = effective_length_factors(support, brace_config)
     except ValueError as e:
         return _err(str(e))
 
-    # Resolve candidate list
     try:
         if sections:
             candidates = list(sections)
@@ -358,59 +534,231 @@ def design_wall(height_ft: float = 10.0, spacing_in: float = 16.0,
     except Exception as e:  # noqa: BLE001
         return _err(f"Could not build candidate list: {e}")
 
-    geom = {"height_ft": height_ft, "spacing_in": spacing_in,
-            "trib_A_ft": trib_A_ft, "trib_B_ft": trib_B_ft, "wall_type": wall_type}
+    geom = {"height_ft": height_ft, "spacing_in": spacing_in, "trib_A_ft": trib_A_ft,
+            "trib_B_ft": trib_B_ft, "wall_type": wall_type, "support": support}
     loads = {"D_wall": D_wall, "D_A": D_A, "L_A": L_A, "D_B": D_B, "L_B": L_B,
-             "S": S, "W_uplift": W_uplift, "W_mwfw": W_mwfw, "W_mwfl": W_mwfl,
-             "W_cc_w": W_cc_w, "W_cc_l": W_cc_l, "L_lat": L_lat, "Eh": Eh, "Ev": Ev}
-    combos = build_load_combinations(loads, geom)
-
-    tried, selected = [], None
+             "Lr": Lr, "S": S, "R": R, "W_uplift": W_uplift, "W_mwfw": W_mwfw,
+             "W_mwfl": W_mwfl, "W_cc_w": W_cc_w, "W_cc_l": W_cc_l, "L_lat": L_lat,
+             "Eh": Eh, "Ev": Ev}
     try:
-        with cfs_session() as s:
-            for ident in candidates:
-                try:
-                    path = s.load(ident)
-                    sd = s.section_data()
-                    gp = s.gross_properties()
-                    gov_uc, gov = -1.0, {"combo": None, "label": None,
-                                         "P_k": None, "Mx_kin": None, "Vy_k": None}
-                    for c in combos:
-                        chk = s.member_check(spec_id, lengths, c)
-                        if chk["UC"] > gov_uc:
-                            gov_uc, gov = chk["UC"], {**c, **chk}
-                    rec = {"section": section_label(path, sd.get("description")),
-                           "weight_plf": gp["weight_plf"],
-                           "governing_UC": round(gov_uc, 4),
-                           "governing_combo": gov["combo"], "governing_label": gov["label"],
-                           "passed": gov_uc <= 1.0}
-                    tried.append(rec)
-                    if gov_uc <= 1.0:
-                        selected = {**rec, "load_path": path,
-                                    "governing_forces": {"P_k": gov["P_k"],
-                                                         "Mx_kin": gov["Mx_kin"],
-                                                         "Vy_k": gov["Vy_k"]}}
-                        break
-                except CFSError as e:
-                    tried.append({"section": ident, "error": str(e)})
-                    continue
-    except CFSError as e:
+        table = build_combo_table(
+            loads, geom, asce_edition=asce_edition, snow_level=snow_level,
+            wind_level=wind_level, combo_set=combo_set, combo_mode=combo_mode,
+            user_combos=user_combos, axial_at=axial_at, line_loads=line_loads,
+            point_loads=point_loads)
+    except ValueError as e:
         return _err(str(e))
+    defl = deflection_cases(table["unfactored_effects"]["lateral_psf"],
+                            table["options"]["wind_level"], wind_defl_modifier)
+    warnings = list(chk["warnings"]) + table["warnings"] + \
+        _support_notes(support, brace_config, kf)
 
+    ctx = _member_ctx(spec_id, lengths, kf, table["combos"], height_ft, spacing_in,
+                      support, defl, defl_limit, bearing_length_in)
+    jr = watchdog.run(jobs.check_sections_job,
+                      {"sections": candidates, "ctx": ctx, "stop_at_first_pass": True},
+                      timeout_s, "design_wall")
+    common = dict(**_spec_fields(spec_id, chk), height_ft=height_ft,
+                  spacing_in=spacing_in, wall_type=wall_type, support=support,
+                  brace_config=brace_config, unbraced_lengths_in=lengths,
+                  effective_length_factors=kf,
+                  load_level_factors=table["load_level_factors"],
+                  load_combinations=table["combos"],
+                  unfactored_effects=table["unfactored_effects"])
+    if not jr.ok:
+        return _job_error(jr, **common, warnings=warnings)
+
+    records = jr.result["records"]
+    selected = next((r for r in records if r.get("passed")), None)
+    tried = [jobs._summary(r) for r in records]
     return _ok(
-        height_ft=height_ft, spacing_in=spacing_in, brace_config=brace_config,
-        unbraced_lengths_in=lengths,
-        spec=f"{SPEC_NAME_BY_ID.get(spec_id)} (enum {spec_id})",
-        load_combinations=combos,
+        **common,
         selected=selected,
         passed=selected is not None,
         message=None if selected else "No candidate section passes; increase size or reduce loads.",
         sections_tried=tried,
+        warnings=warnings + (selected["warnings"] if selected else []),
+        watchdog=jr.diagnostics(),
     )
 
 
 # ---------------------------------------------------------------------------
-# 8. HEADLINE: find custom profiles equivalent to a standard spec
+# 7b. Stacked multi-level wall
+# ---------------------------------------------------------------------------
+@mcp.tool()
+@_doc(LOAD_CONVENTIONS_DOC)
+def design_stacked_wall(levels: List[dict], wall_type: str,
+                        level_defaults: Optional[dict] = None,
+                        axial_at: str = "base",
+                        live_load_reduction: bool = True, KLL: float = 1.0,
+                        live_load_patterns: Optional[List[str]] = None,
+                        check_alignment: bool = True,
+                        spec=None,
+                        asce_edition: str = "7-22", snow_level: Optional[str] = None,
+                        wind_level: str = "strength", combo_set: Optional[str] = None,
+                        combo_mode: str = "builtin",
+                        user_combos: Optional[List[dict]] = None,
+                        defl_limit: Optional[float] = None,
+                        wind_defl_modifier: float = 0.7,
+                        bearing_length_in: float = 1.0,
+                        include_all_combos: bool = True,
+                        building_code: Optional[str] = DEFAULT_BUILDING_CODE,
+                        timeout_s: Optional[float] = None) -> str:
+    """Design / check a STACKED multi-storey stud wall, level by level.
+
+    levels: list of level objects, TOP DOWN (first = the level under the roof).
+      Each level:
+        height_ft, spacing_in (required); trib_A_ft, trib_B_ft
+        D / L (both sides) or D_A, D_B, L_A, L_B - the roof or floor load at the
+          TOP of this level, psf
+        Lr, S, R, W_uplift - roof loads at the top of this level (usually only the
+          top level), psf over trib_A + trib_B
+        D_wall, L_lat, W_mwfw, W_mwfl, W_cc_w, W_cc_l, Eh, Ev - this level's wall
+        brace_config / brace_n (default '48in')
+        section (check one) OR sections (candidates in order; first that passes)
+        grade, fy; L_reducible (default True; False for assembly/garage floors);
+        load_transfer_present (a transfer track/header between this level and the
+          next); line_loads (plf, carried down); point_loads (k/stud, this level)
+      level_defaults: keys merged into every level (e.g. D_wall, L_lat, Ev, brace).
+
+    ACCUMULATION: D, L, Lr, S, R and uplift are carried down through the stack,
+    plus the self-weight of every wall above. Loads arrive as plf along the track
+    and are picked up per stud at each level's own spacing. axial_at='mid_height'
+    subtracts half of the level's own wall weight (Simpson's convention).
+
+    LIVE LOAD REDUCTION (ASCE 7-22 §4.7): per stud, AT = spacing x (trib_A +
+    trib_B) summed over the floors supported; L = Lo(0.25 + 15/sqrt(KLL*AT)) for
+    KLL*AT >= 400 ft^2 (min 0.50Lo one floor / 0.40Lo two+ floors); Lo > 100 psf
+    is not reduced except max 20% for members supporting two+ floors (§4.7.3).
+    KLL defaults to 1.0 (conservative). AT, KLL*AT and the factor per supported
+    floor are reported for every level. Roof live load is not reduced.
+
+    LIVE LOAD PATTERNS: 'AB' both sides, 'A' side A only, 'B' side B only
+    (Simpson Case AB / A / B). Default: all three for interior walls with unequal
+    sides, else AB. Without load eccentricity AB governs axial; A/B are reported.
+
+    ALIGNMENT: consecutive levels whose stud spacings do not stack are flagged
+    (unless load_transfer_present).
+
+    OUTPUT per level (Simpson Stacked Wall Summary columns): section, governing
+    combo, P, M, V, UC, Pa, Pa-Dist, Ma-Fy, Ma-Dist, Ma-Brc, Va, web crippling UC,
+    stiffener required, deflection and L/x; plus the full combo table, LLR and
+    accumulated loads. Levels are pinned-pinned (check a parapet separately with
+    check_stud(support='cantilever')).
+    """
+    try:
+        wt = require_wall_type(wall_type)
+        spec_id, chk = _prep_spec(spec, building_code, asce_edition, True)
+        opts = resolve_combo_options(asce_edition, snow_level, wind_level, combo_set,
+                                     combo_mode, user_combos)
+        if not levels:
+            raise ValueError("levels must be a non-empty list (top level first).")
+        norm = [stacked.normalize_level(lv, i, level_defaults) for i, lv in enumerate(levels)]
+        if live_load_patterns:
+            pats = list(live_load_patterns)
+        else:
+            unequal = wt == "interior" and any(
+                lv["loads"]["L_A"] != lv["loads"]["L_B"] or lv["trib_A_ft"] != lv["trib_B_ft"]
+                for lv in norm)
+            pats = ["AB", "A", "B"] if unequal else ["AB"]
+        if "AB" not in pats:
+            pats = ["AB"] + pats
+        acc = stacked.accumulate(norm, wt, axial_at, live_load_reduction, KLL, pats)
+    except ValueError as e:
+        return _err(str(e))
+
+    defs = combo_defs_for(opts)
+    level_ctxs, level_meta = [], []
+    for lv in acc:
+        try:
+            lengths = unbraced_lengths(lv["height_ft"], lv["brace_config"], lv["brace_n"])
+        except ValueError as e:
+            return _err(f"{lv['name']}: {e}")
+        cands = [lv["section"]] if lv.get("section") else list(lv.get("sections") or [])
+        if not cands:
+            return _err(f"{lv['name']}: give 'section' or 'sections'.")
+        geom = {"height_ft": lv["height_ft"], "spacing_in": lv["spacing_in"],
+                "support": "pinned-pinned"}
+        combos = []
+        for pat in pats:
+            rows = combos_from_effects(defs, lv["effects_by_pattern"][pat], geom)
+            for r in rows:
+                if pat != "AB":
+                    if not r["factors"].get("L"):
+                        continue          # A/B patterns only differ where L acts
+                    r["combo"] = f"{r['combo']} [{pat}]"
+                    r["label"] = f"{r['label']} | live pattern {pat}"
+                r["live_pattern"] = pat
+                combos.append(r)
+        defl = deflection_cases(lv["effects_by_pattern"]["AB"]["lat_psf"],
+                                opts["wind_level"], wind_defl_modifier)
+        ctx = _member_ctx(spec_id, lengths, {"Kx": 1.0, "Ky": 1.0, "Kt": 1.0}, combos,
+                          lv["height_ft"], lv["spacing_in"], "pinned-pinned", defl,
+                          defl_limit, bearing_length_in, grade=lv.get("grade"),
+                          fy=lv.get("fy"))
+        level_ctxs.append({"name": lv["name"], "candidates": cands, "ctx": ctx})
+        level_meta.append({"lv": lv, "lengths": lengths, "combos": combos})
+
+    align = stacked.alignment_flags(norm) if check_alignment else []
+    warnings = list(chk["warnings"]) + list(opts["warnings"]) + [a["flag"] for a in align]
+    common = dict(**_spec_fields(spec_id, chk), wall_type=wt, axial_at=axial_at,
+                  live_load_patterns=pats,
+                  load_level_factors=load_level_factors(opts),
+                  alignment_flags=align)
+
+    jr = watchdog.run(jobs.stacked_job, {"level_ctxs": level_ctxs}, timeout_s,
+                      "design_stacked_wall")
+    if not jr.ok:
+        return _job_error(jr, **common, warnings=warnings)
+
+    summary, details = [], []
+    for meta, res in zip(level_meta, jr.result["levels"]):
+        lv, sel = meta["lv"], res["selected"]
+        if not sel or sel.get("error"):
+            summary.append({"level": lv["name"], "section": None, "passed": False,
+                            "error": (sel or {}).get("error", "no section evaluated")})
+            details.append({"level": lv["name"], "sections_tried": res["sections_tried"]})
+            continue
+        st = sel["strengths"]
+        gf = sel["governing_forces"] or {}
+        web = sel["web_crippling"]
+        dctrl = (sel["deflection"] or {}).get("controlling") or {}
+        summary.append({
+            "level": lv["name"], "section": sel["section"],
+            "height_ft": lv["height_ft"], "spacing_in": lv["spacing_in"],
+            "governing_combo": sel["governing_label"],
+            "P_k": gf.get("P_k"), "M_kin": gf.get("Mx_kin"), "V_k": gf.get("Vy_k"),
+            "UC": sel["governing_UC"],
+            "Pa_k": st["Pa_k"], "Pa_dist_k": st["Pa_dist_k"],
+            "Ma_Fy_kin": st["Ma_Fy_kin"], "Ma_dist_kin": st["Ma_dist_kin"],
+            "Ma_brc_kin": st["Ma_brc_kin"], "Va_k": st["Va_k"],
+            "axial_buckling_mode": st["axial_buckling_mode"],
+            "web_crippling_UC": web.get("UC"),
+            "stiffener_required": web.get("stiffener_required"),
+            "deflection_in": dctrl.get("deflection_in"), "L_over": dctrl.get("L_over"),
+            "deflection_case": dctrl.get("case"),
+            "passed": sel["passed"],
+        })
+        det = {"level": lv["name"], "unbraced_lengths_in": meta["lengths"],
+               "accumulated_plf": lv["accumulated_plf"], "live_load_reduction": lv["llr"],
+               "sections_tried": res["sections_tried"],
+               "selected": sel if include_all_combos else
+               {k: v for k, v in sel.items() if k != "combos"}}
+        details.append(det)
+
+    all_pass = all(r.get("passed") for r in summary)
+    return _ok(
+        **common,
+        all_levels_pass=all_pass,
+        summary=summary,
+        levels=details,
+        warnings=warnings,
+        watchdog=jr.diagnostics(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. Find custom profiles equivalent to a standard spec
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def find_equivalent_profiles(standard: str, height_ft: float,
@@ -419,7 +767,7 @@ def find_equivalent_profiles(standard: str, height_ft: float,
                              custom_directory: Optional[str] = None,
                              recursive: bool = False,
                              brace_config: str = "none",
-                             custom_n: Optional[int] = None,
+                             brace_n: Optional[int] = None,
                              spec=None, tolerance: float = 0.0,
                              standard_grade: Optional[int] = None,
                              standard_fy: Optional[float] = None) -> str:
@@ -443,6 +791,7 @@ def find_equivalent_profiles(standard: str, height_ft: float,
     brace_config:     bracing for BOTH standard and customs (kept identical so
                       the comparison is fair). Default 'none' = full-height
                       unbraced (conservative).
+    spec:             default AISI2016USASD.
 
     Returns the reference strengths, and every custom profile ranked with its
     axial / flexural / stiffness ratios, an 'equivalent' flag, its weight, and
@@ -451,7 +800,7 @@ def find_equivalent_profiles(standard: str, height_ft: float,
     """
     spec_id = resolve_spec(spec)
     try:
-        lengths = unbraced_lengths(height_ft, brace_config, custom_n)
+        lengths = unbraced_lengths(height_ft, brace_config, brace_n)
     except ValueError as e:
         return _err(str(e))
 
@@ -522,7 +871,7 @@ def find_equivalent_profiles(standard: str, height_ft: float,
                 message=(f"{len(equiv)} of {len(customs)} custom profiles are "
                          f"equivalent to {ref['section']} for a {height_ft} ft wall "
                          f"@ {spacing_in}\" o.c."),
-                spec=f"{SPEC_NAME_BY_ID.get(spec_id)} (enum {spec_id})",
+                spec=_spec_str(spec_id),
                 brace_config=brace_config, unbraced_lengths_in=lengths,
                 reference={
                     "section": ref["section"], "load_path": ref["load_path"],
@@ -540,318 +889,193 @@ def find_equivalent_profiles(standard: str, height_ft: float,
         return _err(f"Equivalency evaluation failed: {e}")
 
 
-def _ratio(val, ref):
-    if not ref:
-        return float("inf") if val else 1.0
-    return val / ref
-
-
-def _msbs_depth_in(name: str) -> float:
-    """Nominal depth (in) from an MSBS filename, e.g. '600SLS250-43_18_GA' -> 6.0."""
-    import re as _re
-    m = _re.match(r"\s*(\d{2,4})", name or "")
-    return int(m.group(1)) / 100.0 if m else -1.0
-
-
 # ---------------------------------------------------------------------------
-# 9. HEADLINE: substitute a standard wall spec with MSBS sections
-#    (considers single/double sections AND different stud spacings)
+# 9. HEADLINE: substitute a standard wall spec with MSBS (or standard) sections
+#    Depth-matched, exhaustive spacing/category/gauge matrix, lightest-per-ft
+#    selection, cross-floor alignment check, gauge ceiling + standard fallback.
 # ---------------------------------------------------------------------------
-DEFAULT_SPACINGS = [12.0, 16.0, 19.2, 24.0]
-
-
 @mcp.tool()
-def find_wall_substitutions(standard: str, height_ft: float,
+def find_wall_substitutions(standard: str, height_ft: float, wall_type: str,
                             spacing_in: float = 16.0,
-                            brace_config: str = "none",
-                            custom_n: Optional[int] = None,
+                            brace_config: str = "48in",
+                            brace_n: Optional[int] = None,
+                            reference_n: int = 1,
                             msbs_directory: Optional[str] = None,
                             categories: Optional[List[str]] = None,
+                            include_boxed: bool = False,
                             allowed_spacings: Optional[List[float]] = None,
                             depth_filter_in: Optional[List[float]] = None,
+                            adjacent_spacing_in: Optional[float] = None,
+                            load_transfer_present: bool = False,
                             governing: str = "both",
+                            include_all_configs: bool = False,
+                            include_trace: bool = False,
                             spec=None, tolerance: float = 0.0,
                             standard_grade: Optional[int] = None,
-                            standard_fy: Optional[float] = None) -> str:
-    """Evaluate EVERY MSBS profile as a substitute for a standard wall spec and
-    return the full ratio table — passing AND failing — for the engineer to judge.
+                            standard_fy: Optional[float] = None,
+                            building_code: Optional[str] = DEFAULT_BUILDING_CODE,
+                            timeout_s: Optional[float] = None) -> str:
+    """Substitute a standard wall spec with the most efficient MSBS section.
 
-    The tool computes; it does NOT hide options. A profile may pass axial (P) but
-    fail flexural (Mx); on an interior wall with no wind, Mx demand is zero and the
-    Mx shortfall is irrelevant — that call belongs to the engineer, so BOTH ratios
-    are always reported.
+    Evaluates a FULL matrix (every candidate x every spacing x every gauge at the
+    matched depth), then selects the lightest-per-ft passing wall, preferring a
+    single section over a double at comparable weight. Nothing is auto-accepted:
+    a candidate that passes axial (P) but fails moment (Mx) is returned flagged
+    for the engineer to judge - for interior AND exterior walls alike.
 
-    Example (single profiles, sheet-width spacing then half-sheet fallback):
-      find_wall_substitutions(standard="400S300-68", height_ft=10, spacing_in=30,
-          brace_config="quarter", allowed_spacings=[30, 15],
-          categories=["single"], governing="axial")   # interior, no wind
+    REQUIRED
+      standard    the section being replaced (e.g. '600S200-43').
+      height_ft   wall height.
+      wall_type   'interior' | 'exterior'. Required - never silently defaulted.
 
-    METHOD — capacity per foot of wall. A wall is a section AT a spacing. Member
-    strength depends only on the section + unbraced length (NOT spacing), so each
-    profile is evaluated by CFS once, then spacings are swept analytically. At
-    spacing s a profile's per-foot capacity is (P/s, Mx/s); the reference is
-    (P_ref/spacing_in, Mx_ref/spacing_in). Every ratio scales by
-    (spacing_in / s).
+    REFERENCE MULTIPLIER
+      reference_n number of PLIES in the reference wall being replaced (default 1).
+                  reference_n=2 models a back-to-back DOUBLE standard wall: the
+                  reference P, Mx, Ix and weight are all multiplied by N (an
+                  idealized stacked-ply approximation that ignores built-up
+                  slenderness reduction - noted in flags). This multiplies ONLY the
+                  reference side of the comparison. brace_n (bracing segments) does
+                  NOT affect capacity and is a separate parameter.
 
-    PARAMETERS
-      spacing_in       reference wall's stud spacing (defines the demand basis).
-      allowed_spacings ORDERED spacings (in) to try for substitutes, most-preferred
-                       first, e.g. [30, 15] (30" = sheet width, 15" = fallback).
-                       Used EXACTLY as given — the reference spacing is NOT auto-
-                       added. Default [12, 16, 19.2, 24].
-      categories       ['single'] and/or ['double'] (default both). Use ['single']
-                       when double back-to-back / box build-ups are not allowed.
-      depth_filter_in  restrict candidates to these nominal depths (e.g. [4.0]).
-      governing        which strength must pass for a spacing to be 'ok':
-                         'both'     - P AND Mx (default; exterior / wind walls)
-                         'axial'    - P only  (interior wall, no lateral/wind)
-                         'flexural' - Mx only
-                       Ratios for BOTH P and Mx are always reported regardless.
-      tolerance        fractional shortfall allowed on the governing check(s),
-                       e.g. 0.02 lets a 0.98 ratio count as passing.
+    DEPTH MATCHING
+      Candidates are matched to the nearest AVAILABLE MSBS depth to the reference's
+      actual depth (computed from the library, no hardcoded table). depth_filter_in
+      overrides with explicit depths.
 
-    RETURNS, per profile (ALL of them, ranked passing-first then by closeness):
-      axial_ratio / flexural_ratio / stiffness_ratio / weight_ratio at the best
-      (widest passing) spacing, max continuous spacing for P-only, Mx-only and
-      combined, and a `by_spacing` breakdown giving each ratio + axial_ok /
-      flexural_ok / passes at every allowed spacing. `best_spacing_in` is the
-      widest allowed spacing meeting `governing` (null if none). Plus flags/notes.
+    SPACING SWEEP (exhaustive - never stops at the first pass)
+      Default spacings = [original spacing_in, 12, 16, 24]. Override with
+      allowed_spacings (used exactly as given). Member strength is spacing-
+      independent, so each section is evaluated once and spacings swept
+      analytically; every spacing is scored against every category and gauge.
+
+    CATEGORIES
+      Default single + double; single is always tried first. Double defaults to
+      back-to-back (B2B) ONLY. Set include_boxed=True to also consider BOX builds.
+
+    CROSS-FLOOR ALIGNMENT
+      Pass adjacent_spacing_in (the stud spacing of the level above/below) and
+      load_transfer_present=False when that level has no top-track/transfer member.
+      If the selected spacing does not stack with the adjacent studs, an alignment
+      flag is returned (point loads may not land on a stud).
+
+    GAUGE CEILING + FALLBACK
+      If the reference gauge exceeds the heaviest MSBS gauge at the matched depth,
+      an explicit ceiling flag is returned. If NO MSBS single/double passes at any
+      spacing, the search extends to standard (non-MSBS) sections at the matched
+      depth, labeled category='standard', so you always get an answer.
+
+    SPEC / WATCHDOG
+      spec defaults to AISI2016USASD (S100-16 w/S2-20); a spec that does not match
+      building_code returns a warning. Runs under the watchdog (timeout_s, default
+      60 s): on a hang, the profiles evaluated so far are returned as partials.
+
+    OUTPUT
+      * substitution_table (ALWAYS): one plain-language row - original -> substitute,
+        spacing, category, P ratio, Mx ratio, and a status column readable by a GC/PM.
+      * selected: the chosen substitution with actual capacities and required values.
+      * profiles: per-candidate detail incl. by_spacing ratios (always).
+      * audit_table (include_all_configs=True): EVERY tried (section,spacing,gauge)
+        row - pass and fail - with a single most_efficient=true row.
+      * include_trace=True attaches CFS's calculation trace per evaluated section.
     """
-    spec_id = resolve_spec(spec)
+    if wall_type not in ("interior", "exterior"):
+        return _err("wall_type is required and must be 'interior' or 'exterior'.")
     governing = (governing or "both").lower()
     if governing not in ("both", "axial", "flexural"):
         return _err("governing must be 'both', 'axial', or 'flexural'.")
-    spacings = sorted({float(s) for s in (allowed_spacings or DEFAULT_SPACINGS)},
-                      reverse=True)  # widest (most preferred) first
     try:
-        lengths = unbraced_lengths(height_ft, brace_config, custom_n)
+        spec_id, chk = _prep_spec(spec, building_code, None, False)
+    except ValueError as e:
+        return _err(str(e))
+    reference_n = max(1, int(reference_n or 1))
+    tol_factor = 1.0 - tolerance
+
+    try:
+        lengths = unbraced_lengths(height_ft, brace_config, brace_n)
     except ValueError as e:
         return _err(str(e))
 
+    ref_parsed = parse_designation(standard)
+    ref_depth = ref_parsed["depth_in"] if ref_parsed else substitution.depth_from_name(standard)
+    ref_mils = ref_parsed["mils"] if ref_parsed else substitution.mils_from_name(standard)
+
+    if allowed_spacings:
+        spacings, seen = [], set()
+        for sp in allowed_spacings:
+            sp = round(float(sp), 4)
+            if sp > 0 and sp not in seen:
+                seen.add(sp)
+                spacings.append(sp)
+    else:
+        spacings = substitution.default_spacings(spacing_in)
+
     try:
         msbs = catalog.list_msbs_sections(msbs_directory, categories)
-        if depth_filter_in:
-            depths = [float(d) for d in depth_filter_in]
-            msbs = [m for m in msbs
-                    if any(abs(_msbs_depth_in(m["name"]) - d) <= 1e-6 for d in depths)]
+        if not include_boxed:
+            msbs = [m for m in msbs if m["folder"] != "BOX"]
         if not msbs:
             return _err("No MSBS sections found for the given filters. Check "
-                        "msbs_directory / categories / depth_filter_in, or the "
-                        "bundled Info-and-Examples/Sections folders.")
+                        "msbs_directory / categories, or the bundled "
+                        "Info-and-Examples/Sections folders.")
     except Exception as e:  # noqa: BLE001
         return _err(f"Could not list MSBS sections: {e}")
 
-    def _passes(axial_ok, flex_ok):
-        if governing == "axial":
-            return axial_ok
-        if governing == "flexural":
-            return flex_ok
-        return axial_ok and flex_ok
+    all_depths = [substitution.depth_from_name(m["name"]) for m in msbs]
+    if depth_filter_in:
+        target_depths = {round(float(d), 4) for d in depth_filter_in}
+        matched_depth = None
+    else:
+        matched_depth = substitution.nearest_depth(ref_depth, all_depths)
+        target_depths = {matched_depth} if matched_depth is not None else set()
+    msbs = [m for m in msbs
+            if round(substitution.depth_from_name(m["name"]), 4) in target_depths]
+    if not msbs:
+        return _err(f"No MSBS candidates at the matched depth "
+                    f"{sorted(target_depths)} (reference depth {ref_depth}\").")
 
-    try:
-        with cfs_session() as s:
-            ref = _evaluate(s, standard, spec_id, lengths,
-                            grade=standard_grade, fy=standard_fy)
-            if "error" in ref:
-                return _err(f"Could not evaluate standard '{standard}': {ref['error']}")
-            ref_P = ref["member_strength"]["P_k"] or 0.0
-            ref_Mx = ref["member_strength"]["Mx_kin"] or 0.0
-            ref_Ix = ref["gross"]["Ix_in4"] or 0.0
-            ref_w = ref["gross"]["weight_plf"] or 0.0
-            ref_w_psf = ref_w * 12.0 / spacing_in
-            tol = 1.0 - tolerance
+    candidate_mils = [substitution.mils_from_name(m["name"]) for m in msbs]
+    ceiling_depth = matched_depth if matched_depth is not None else ref_depth
+    gauge_flag = substitution.gauge_ceiling_flag(ref_mils, candidate_mils, ceiling_depth)
 
-            profiles = []
-            for m in msbs:
-                disp = m["name"] if m["folder"] == "SINGLE" \
-                    else f"{m['name']} [{m['folder']}]"
-                r = _evaluate(s, m["path"], spec_id, lengths)
-                if "error" in r:
-                    profiles.append({"section": disp, "category": m["category"],
-                                     "error": r["error"], "passes": False,
-                                     "best_spacing_in": None})
-                    continue
-                cP = r["member_strength"]["P_k"] or 0.0
-                cMx = r["member_strength"]["Mx_kin"] or 0.0
-                cIx = r["gross"]["Ix_in4"] or 0.0
-                cw = r["gross"]["weight_plf"] or 0.0
-                flags = r["member_strength"]["flags"]
+    top_flags: List[str] = list(chk["warnings"])
+    if gauge_flag:
+        top_flags.append(gauge_flag)
+    if reference_n > 1:
+        top_flags.append(
+            f"reference_n={reference_n}: the reference capacity (P, Mx, Ix) and "
+            f"weight are the single-ply values multiplied by {reference_n}. This is "
+            f"an idealized stacked-ply model; a real built-up section has reduced "
+            f"slenderness capacity - verify the built-up reference explicitly.")
 
-                # capacity ratios (independent of spacing): substitute vs reference
-                cap_P = _ratio(cP, ref_P)
-                cap_Mx = _ratio(cMx, ref_Mx)
-                cap_Ix = _ratio(cIx, ref_Ix)
-
-                # max continuous spacings = ref spacing scaled by capacity ratio
-                max_axial = spacing_in * cap_P
-                max_flex = spacing_in * cap_Mx
-                max_comb = min(max_axial, max_flex)
-
-                by_spacing, best = [], None
-                for sp in spacings:  # widest first
-                    scale = spacing_in / sp   # ratio at this spacing
-                    aP, aMx, aIx = cap_P * scale, cap_Mx * scale, cap_Ix * scale
-                    aW = _ratio(cw, ref_w) * scale
-                    a_ok, m_ok = aP >= tol, aMx >= tol
-                    passes_here = _passes(a_ok, m_ok)
-                    by_spacing.append({
-                        "spacing_in": sp,
-                        "axial_ratio": round(aP, 3), "flexural_ratio": round(aMx, 3),
-                        "stiffness_ratio": round(aIx, 3), "weight_ratio": round(aW, 3),
-                        "weight_psf": round(cw * 12.0 / sp, 4),
-                        "axial_ok": a_ok, "flexural_ok": m_ok, "passes": passes_here,
-                    })
-                    if passes_here and best is None:
-                        best = sp  # spacings are widest-first, so first pass = widest
-
-                rec = {
-                    "section": disp, "category": m["category"], "folder": m["folder"],
-                    "members_per_stud": m["members_per_stud"],
-                    "section_type": r["section_type"],
-                    "member_weight_plf": cw,
-                    "axial_P_k": cP, "flexural_Mx_kin": cMx, "Ix_in4": cIx,
-                    "capacity_axial_ratio": round(cap_P, 3),
-                    "capacity_flexural_ratio": round(cap_Mx, 3),
-                    "capacity_stiffness_ratio": round(cap_Ix, 3),
-                    "max_continuous_spacing_axial_in": round(max_axial, 2),
-                    "max_continuous_spacing_flexural_in": round(max_flex, 2),
-                    "max_continuous_spacing_combined_in": round(max_comb, 2),
-                    "flags": flags, "flag_notes": describe_flags(flags),
-                    "by_spacing": by_spacing,
-                    "best_spacing_in": best,
-                    "passes": best is not None,
-                }
-                if best is not None:
-                    rec["axial_ratio"] = round(cap_P * spacing_in / best, 3)
-                    rec["flexural_ratio"] = round(cap_Mx * spacing_in / best, 3)
-                    rec["stiffness_ratio"] = round(cap_Ix * spacing_in / best, 3)
-                    rec["weight_psf"] = round(cw * 12.0 / best, 4)
-                    rec["lighter_than_original"] = rec["weight_psf"] < ref_w_psf
-                profiles.append(rec)
-
-            # rank: passing first (lightest at best spacing), then failing by how
-            # close they get on the governing check at the tightest allowed spacing
-            tightest = spacings[-1] if spacings else spacing_in
-
-            def close_score(p):
-                if p.get("error"):
-                    return -1.0
-                sc = spacing_in / tightest
-                aP = p["capacity_axial_ratio"] * sc
-                aMx = p["capacity_flexural_ratio"] * sc
-                if governing == "axial":
-                    return aP
-                if governing == "flexural":
-                    return aMx
-                return min(aP, aMx)
-
-            profiles.sort(key=lambda p: (
-                not p.get("passes", False),
-                p["weight_psf"] if p.get("passes") else -close_score(p),
-            ))
-
-            passing = [p for p in profiles if p.get("passes")]
-            recommended = passing[0] if passing else None
-            if recommended:
-                msg = (f"{len(passing)} of {len(profiles)} profiles pass on "
-                       f"'{governing}'. Lightest: {recommended['section']} @ "
-                       f"{recommended['best_spacing_in']}\" o.c. "
-                       f"({recommended['weight_psf']} psf vs {round(ref_w_psf,4)} psf "
-                       f"original). Full ratio table returned for all profiles.")
-            else:
-                closest = profiles[0] if profiles and not profiles[0].get("error") else None
-                extra = ""
-                if closest:
-                    extra = (f" Closest: {closest['section']} reaches "
-                             f"{closest['max_continuous_spacing_combined_in']}\" "
-                             f"combined / {closest['max_continuous_spacing_axial_in']}\" "
-                             f"axial-only max spacing.")
-                msg = (f"No profile passes on '{governing}' at any allowed spacing "
-                       f"{spacings}.{extra} Full ratio table returned so you can see "
-                       f"how far each is and judge (e.g. axial-only for interior walls).")
-
-            return _ok(
-                message=msg,
-                spec=f"{SPEC_NAME_BY_ID.get(spec_id)} (enum {spec_id})",
-                governing=governing,
-                brace_config=brace_config, unbraced_lengths_in=lengths,
-                allowed_spacings_in=spacings,
-                reference={
-                    "section": ref["section"], "spacing_in": spacing_in,
-                    "axial_P_k": ref_P, "flexural_Mx_kin": ref_Mx, "Ix_in4": ref_Ix,
-                    "member_weight_plf": ref_w, "weight_psf": round(ref_w_psf, 4),
-                },
-                recommended=recommended,
-                passing_count=len(passing),
-                total_evaluated=len(profiles),
-                profiles=profiles,
-            )
-    except CFSError as e:
-        return _err(str(e))
-    except Exception as e:  # noqa: BLE001
-        return _err(f"Substitution search failed: {e}")
+    params = {
+        "standard": standard, "standard_grade": standard_grade,
+        "standard_fy": standard_fy, "spec_id": spec_id, "lengths": lengths,
+        "spacing_in": spacing_in, "spacings": spacings, "reference_n": reference_n,
+        "governing": governing, "tol_factor": tol_factor,
+        "include_trace": include_trace, "include_all_configs": include_all_configs,
+        "msbs": msbs, "target_depths": sorted(target_depths), "ref_depth": ref_depth,
+        "top_flags": top_flags, "adjacent_spacing_in": adjacent_spacing_in,
+        "load_transfer_present": load_transfer_present,
+    }
+    common = dict(**_spec_fields(spec_id, chk), wall_type=wall_type, governing=governing,
+                  brace_config=brace_config, brace_n=brace_n,
+                  unbraced_lengths_in=lengths, reference_n=reference_n,
+                  matched_depth_in=matched_depth, allowed_spacings_in=spacings)
+    jr = watchdog.run(jobs.substitution_job, {"p": params}, timeout_s,
+                      "find_wall_substitutions")
+    if not jr.ok:
+        return _job_error(jr, **common, flags=top_flags)
+    return _ok(**common, **jr.result, watchdog=jr.diagnostics())
 
 
 # ---------------------------------------------------------------------------
 # 10. Batch code-check members (ETABS / SAP2000 truss or frame integration)
 # ---------------------------------------------------------------------------
-def _member_lengths(m: dict, spec_default_brace: str = "none") -> dict:
-    """Resolve a member's unbraced lengths from its dict.
-
-    Length keys may sit at the TOP LEVEL of the member dict or inside a nested
-    `lengths` sub-dict — both are accepted. Priority order:
-      * explicit Lx_in/Ly_in/Lt_in/Lm_in
-      * Lu_in (applied to all four)
-      * length_ft (+ optional brace_config / custom_n)
-    """
-    src = dict(m)
-    if isinstance(m.get("lengths"), dict):
-        src = {**m, **m["lengths"]}  # nested `lengths` keys override / fill in
-    if any(k in src for k in ("Lx_in", "Ly_in", "Lt_in", "Lm_in")):
-        base = src.get("Lu_in")
-        def g(k):
-            v = src.get(k, base)
-            if v is None:
-                raise ValueError(f"Member '{m.get('id')}' missing {k} (or Lu_in).")
-            return float(v)
-        return {"Lx": g("Lx_in"), "Ly": g("Ly_in"), "Lt": g("Lt_in"), "Lm": g("Lm_in")}
-    if src.get("Lu_in") is not None:
-        L = float(src["Lu_in"])
-        return {"Lx": L, "Ly": L, "Lt": L, "Lm": L}
-    if src.get("length_ft") is not None:
-        return unbraced_lengths(float(src["length_ft"]),
-                                src.get("brace_config", spec_default_brace),
-                                src.get("custom_n"))
-    raise ValueError(
-        f"Member '{m.get('id')}' has no length info. Provide length keys either at "
-        f"the top level or inside a 'lengths' object: Lx_in/Ly_in/Lt_in/Lm_in, or "
-        f"Lu_in, or length_ft (+brace_config)."
-    )
-
-
-# Rough sanity bounds for a single CFS member (kip / kip-inch). Values beyond
-# these usually mean the caller passed pounds instead of kips.
-_P_SANITY_K = 500.0
-_M_SANITY_KIN = 10000.0
-
-
-def _force_unit_warnings(mid, forces: dict) -> List[str]:
-    w = []
-    P = abs(forces.get("P_k", 0.0) or 0.0)
-    Mx = abs(forces.get("Mx_kin", 0.0) or 0.0)
-    My = abs(forces.get("My_kin", 0.0) or 0.0)
-    if P > _P_SANITY_K:
-        w.append(f"Member '{mid}': P_k={P} looks large for kips — did you pass "
-                 f"POUNDS? CFS expects kips (divide lb by 1000).")
-    if max(Mx, My) > _M_SANITY_KIN:
-        w.append(f"Member '{mid}': moment {max(Mx, My)} looks large for kip-in — "
-                 f"did you pass lb-in? CFS expects kip-inches.")
-    return w
-
-
 @mcp.tool()
 def check_members_batch(members: List[dict], spec=None,
-                        brace_config: str = "none") -> str:
+                        brace_config: str = "none",
+                        building_code: Optional[str] = DEFAULT_BUILDING_CODE,
+                        timeout_s: Optional[float] = None) -> str:
     """Code-check many members against applied forces — for ETABS/SAP2000 output.
 
     Feed the results of a frame/truss analysis (e.g. from the ETABS MCP) straight
@@ -865,7 +1089,9 @@ def check_members_batch(members: List[dict], spec=None,
         id       - label (e.g. frame name from ETABS)
         section  - designation / .cfss path / library path
         forces   - {P_k, Mx_kin, My_kin, Vy_k, Vx_k}
-        lengths  - ONE of: Lx_in/Ly_in/Lt_in/Lm_in, or Lu_in, or length_ft(+brace_config).
+        lengths  - ONE of: Lx_in/Ly_in/Lt_in[/Lm_in], or Lu_in, or length_ft(+brace_config).
+                   Lm_in (distortional) is optional: if omitted, Lm = Lt and a
+                   warning says so.
                    These may be TOP-LEVEL keys OR inside a nested "lengths" object;
                    both work.
         grade,fy - optional overrides
@@ -875,8 +1101,17 @@ def check_members_batch(members: List[dict], spec=None,
     flip the sign of ETABS axial forces before passing them in. Mx is k-in with
     compression-on-top positive.
 
+    To avoid the silent tension-vs-compression trap, each member may carry a
+    "force_type": "compression" | "tension" | "auto" (default "auto"). With
+    "compression"/"tension" the P_k MAGNITUDE is signed for you; with "auto" the
+    sign is used as given and a negative P_k returns a warning that it was read as
+    tension. This lets you pass compression as a positive magnitude without
+    remembering CFS's rule.
+
     UNITS: kips and kip-inches. If your model is in lb / lb-in, convert first
     (divide by 1000). The tool emits a warning if a force looks like wrong units.
+    Forces are applied exactly as given - they must already be ASD-level for an
+    ASD spec (default AISI2016USASD).
 
     Zero-shear-capacity sections (e.g. a BendRadius geometry flag) are handled
     honestly: if there is no applied shear the shear-interaction check is excluded
@@ -886,74 +1121,38 @@ def check_members_batch(members: List[dict], spec=None,
     Returns per-member unity check (UC, governing_check, PASS/FAIL, member
     strengths, NoteFlags with plain-English notes, warnings) and an overall
     summary. Sections are loaded once and reused across members that share them.
+    Runs under the watchdog (timeout_s, default 60 s): on a hang, the members
+    checked so far are returned as partial_results.
     """
-    spec_id = resolve_spec(spec)
+    try:
+        spec_id, chk = _prep_spec(spec, building_code, None, False)
+    except ValueError as e:
+        return _err(str(e))
     if not members:
         return _err("No members provided.")
-
-    # group by (section, grade, fy) so each unique section loads once
-    order = {id(m): i for i, m in enumerate(members)}
-    groups: dict = {}
     try:
-        for m in members:
-            key = (str(m.get("section")), m.get("grade"), m.get("fy"))
-            groups.setdefault(key, []).append(m)
+        members = [dict(m) for m in members]
     except Exception as e:  # noqa: BLE001
         return _err(f"Bad members input: {e}")
 
-    results = []
-    try:
-        with cfs_session() as s:
-            for (section, grade, fy), grp in groups.items():
-                try:
-                    path = s.load(section, grade=grade, fy=fy)
-                    sd = s.section_data()
-                    label = section_label(path, sd.get("description"))
-                except CFSError as e:
-                    for m in grp:
-                        results.append({"id": m.get("id"), "section": section,
-                                        "error": str(e), "status": "ERROR"})
-                    continue
-                for m in grp:
-                    try:
-                        lengths = _member_lengths(m, brace_config)
-                    except ValueError as e:
-                        results.append({"id": m.get("id"), "section": label,
-                                        "error": str(e), "status": "ERROR"})
-                        continue
-                    fc = m.get("forces", {})
-                    chk = s.member_check(spec_id, lengths, fc)
-                    warns = list(chk.get("warnings", [])) + _force_unit_warnings(m.get("id"), fc)
-                    results.append({
-                        "id": m.get("id"), "section": label,
-                        "unbraced_lengths_in": lengths,
-                        "forces": fc,
-                        "PMxMy1": chk["PMxMy1"], "PMxMy2": chk["PMxMy2"],
-                        "MxVy": chk["MxVy"], "MyVx": chk["MyVx"],
-                        "UC": chk["UC"], "governing_check": chk["governing_check"],
-                        "status": chk["status"], "flags": chk["flags"],
-                        "flag_notes": chk["flag_notes"],
-                        "strengths": chk["strengths"],
-                        "warnings": warns,
-                    })
-    except CFSError as e:
-        return _err(str(e))
-    except Exception as e:  # noqa: BLE001
-        return _err(f"Batch check failed: {e}")
-
-    results.sort(key=lambda r: order.get(
-        next((id(m) for m in members if m.get("id") == r.get("id")), 0), 0))
+    jr = watchdog.run(jobs.batch_job, {"members": members, "spec_id": spec_id,
+                                       "brace_config": brace_config},
+                      timeout_s, "check_members_batch")
+    if not jr.ok:
+        return _job_error(jr, **_spec_fields(spec_id, chk), total=len(members),
+                          warnings=chk["warnings"])
+    results = jr.result["members"]
     checked = [r for r in results if r.get("status") in ("PASS", "FAIL")]
     failed = [r for r in checked if r["status"] == "FAIL"]
     errored = [r for r in results if r.get("status") == "ERROR"]
     worst = max((r["UC"] for r in checked), default=None)
     return _ok(
-        spec=f"{SPEC_NAME_BY_ID.get(spec_id)} (enum {spec_id})",
+        **_spec_fields(spec_id, chk),
         total=len(members), passed=len(checked) - len(failed),
         failed=len(failed), errored=len(errored),
         all_passed=len(failed) == 0 and len(errored) == 0,
         governing_UC=round(worst, 4) if worst is not None else None,
-        members=results,
+        members=results, warnings=chk["warnings"], watchdog=jr.diagnostics(),
     )
 
 

@@ -1,7 +1,7 @@
 # FILE: catalog.py
 # PURPOSE: Enumerate standard (SSMA) profiles, list custom .cfss libraries, and
 #          parse free-text wall specifications like "10ft tall, 600S200-43 @ 16 O.C."
-# STATUS: Version 0.1.0.1 - Developed (bug-fix pass from tester report); not yet re-validated
+# STATUS: Version 0.1.0.2 - Developed (Phase 1 fix pass); not yet MCP re-validated
 # AUTHOR: Hugo Velasco (Hugo VelP)
 
 from __future__ import annotations

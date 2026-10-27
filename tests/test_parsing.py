@@ -21,7 +21,8 @@ def test_parse_designation_rejects_junk():
 def test_resolve_spec_name_and_int():
     assert resolve_spec("AISI2024USASD") == 42
     assert resolve_spec(37) == 42 - 5  # 37
-    assert resolve_spec(None) == 42
+    # default = code of record: AISI S100-16 (2020) w/S2-20 (IBC 2024)
+    assert resolve_spec(None) == 27
 
 
 def test_wall_spec_compound_spacing():
